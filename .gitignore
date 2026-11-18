@@ -1,0 +1,7 @@
+*.idea
+.idea/*
+bin/
+bin/*
+artifacts/
+build/
+__pycache__/
