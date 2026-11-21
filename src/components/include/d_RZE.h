@@ -125,7 +125,7 @@ static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byt
 
 
 template <typename T>
-static __device__ inline void d_iRZE(int& csize, byte in [CS], byte out [CS], byte temp [CS])
+static __device__ inline void d_iRZE(int& csize, const byte in [CS], byte out [CS], byte temp [CS])
 {
   const int tid = threadIdx.x;
   int rpos = csize;
@@ -201,7 +201,7 @@ static __device__ inline void d_iRZE(int& csize, byte in [CS], byte out [CS], by
     __syncthreads();
 
     // copy non-zero values based on bitmap
-    if (size > 0) d_ZEdecode(size, (T*)in, (T*)bitmap, (T*)out, temp_w);
+    if (size > 0) d_ZEdecode(size, (const T*)in, (T*)bitmap, (T*)out, temp_w);
   }
 }
 

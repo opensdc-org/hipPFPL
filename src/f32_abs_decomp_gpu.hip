@@ -46,6 +46,7 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <cassert>
 #include <stdexcept>
@@ -53,68 +54,12 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #include <sys/time.h>
 #include "include/macros.h"
 #include "include/sum_reduction.h"
-#include "include/max_scan.h"
 #include "include/prefix_sum.h"
-#include "components/d_DIFFNB_4.h"
 #include "components/d_BIT_4.h"
 #include "components/d_RZE_1.h"
 
 
 const int NUM_RUNS = 9;
-
-
-// copy (len) bytes from global memory (source) to shared memory (destination) using separate shared memory buffer (temp)
-// destination and temp must we word aligned, accesses up to CS + 3 bytes in temp
-static inline __device__ void g2s(void* const __restrict__ destination, const void* const __restrict__ source, const int len, void* const __restrict__ temp)
-{
-  const int tid = threadIdx.x;
-  const byte* const __restrict__ input = (byte*)source;
-  if (len < 128) {
-    byte* const __restrict__ output = (byte*)destination;
-    if (tid < len) output[tid] = input[tid];
-  } else {
-    const int nonaligned = (int)(size_t)input;
-    const int wordaligned = (nonaligned + 3) & ~3;
-    const int linealigned = (nonaligned + 127) & ~127;
-    const int bcnt = wordaligned - nonaligned;
-    const int wcnt = (linealigned - wordaligned) / 4;
-    int* const __restrict__ out_w = (int*)destination;
-    if (bcnt == 0) {
-      const int* const __restrict__ in_w = (int*)input;
-      byte* const __restrict__ out = (byte*)destination;
-      if (tid < wcnt) out_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < len / 4; i += TPB) {
-        out_w[i] = in_w[i];
-      }
-      if (tid < (len & 3)) {
-        const int i = len - 1 - tid;
-        out[i] = input[i];
-      }
-    } else {
-      const int offs = 4 - bcnt;  //(4 - bcnt) & 3;
-      const int shift = offs * 8;
-      const int rlen = len - bcnt;
-      const int* const __restrict__ in_w = (int*)&input[bcnt];
-      byte* const __restrict__ buffer = (byte*)temp;
-      byte* const __restrict__ buf = (byte*)&buffer[offs];
-      int* __restrict__ buf_w = (int*)&buffer[4];  //(int*)&buffer[(bcnt + 3) & 4];
-      if (tid < bcnt) buf[tid] = input[tid];
-      if (tid < wcnt) buf_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < rlen / 4; i += TPB) {
-        buf_w[i] = in_w[i];
-      }
-      if (tid < (rlen & 3)) {
-        const int i = len - 1 - tid;
-        buf[i] = input[i];
-      }
-      __syncthreads();
-      buf_w = (int*)buffer;
-      for (int i = tid; i < (len + 3) / 4; i += TPB) {
-        out_w[i] = __funnelshift_r(buf_w[i], buf_w[i + 1], shift);
-      }
-    }
-  }
-}
 
 
 static __device__ int g_chunk_counter;
@@ -126,29 +71,64 @@ static __global__ void d_reset()
 }
 
 
-static __device__ inline void d_iQABS_4(int& csize, byte in [CS], byte out [CS], const float errorbound)
+static __device__ inline void copy_raw_chunk(const byte* source, byte* destination, int bytes)
 {
-  using ftype = float;
-  using itype = int;
-  const int size = csize / sizeof(ftype);
   const int tid = threadIdx.x;
-
-  const int mantissabits = 23;
-  const ftype eb2 = 2 * errorbound;
-
-  const itype* const data_i = (itype*)in;
-  ftype* const data_f = (ftype*)out;
-
-  for (int i = tid; i < size; i += TPB) {
-    itype bin = data_i[i];
-    ftype val;
-    if ((0 <= bin) && (bin < (1 << mantissabits))) {  // is encoded value
-      bin = (bin >> 1) ^ (((bin << 31) >> 31));  // TCMS decoding
-      val = bin * eb2;
-    } else {
-      val = *((ftype*)&bin);
+  auto* output_words = reinterpret_cast<unsigned long long*>(destination);
+  if ((reinterpret_cast<std::uintptr_t>(source) & 7u) == 0) {
+    const auto* input_words = reinterpret_cast<const unsigned long long*>(source);
+    for (int i = tid; i < bytes / 8; i += TPB) {
+      output_words[i] = input_words[i];
     }
-    data_f[i] = val;
+  } else {
+    for (int i = tid; i < bytes / 8; i += TPB) {
+      __builtin_memcpy(output_words + i, source + 8 * i, 8);
+    }
+  }
+
+  const int tail = bytes % 8;
+  if (tid < tail) {
+    destination[bytes - tail + tid] = source[bytes - tail + tid];
+  }
+}
+
+
+static __device__ inline void restore_diff_quant(byte* destination, int bytes,
+                                                   int* scratch, float eb2)
+{
+  constexpr int words_per_thread = CS / sizeof(float) / TPB;
+  static_assert(CS % (sizeof(float) * TPB) == 0);
+  constexpr unsigned int diff_bias = 0xAAAAAAAAu;
+  constexpr unsigned int max_quantized_code = 1u << 23;
+  auto* words = reinterpret_cast<unsigned int*>(destination);
+  const int word_count = bytes / sizeof(float);
+  const int tid = threadIdx.x;
+  const int begin = tid * word_count / TPB;
+  const int count = (tid + 1) * word_count / TPB - begin;
+
+  // Each thread owns a contiguous range. Retain its differences across the
+  // block scan so that expanded quantized words can be restored in place.
+  unsigned int diffs[words_per_thread];
+  unsigned int sum = 0;
+  #pragma unroll
+  for (int i = 0; i < words_per_thread; ++i) {
+    const unsigned int diff = (i < count) ? (words[begin + i] ^ diff_bias) - diff_bias : 0u;
+    diffs[i] = diff;
+    sum += diff;
+  }
+  sum = block_prefix_sum(sum, scratch);
+
+  #pragma unroll
+  for (int i = words_per_thread - 1; i >= 0; --i) {
+    if (i < count) {
+      unsigned int bits = sum;
+      if (bits < max_quantized_code) {
+        const int bin = static_cast<int>(bits >> 1) ^ -static_cast<int>(bits & 1u);
+        bits = __float_as_uint(bin * eb2);
+      }
+      words[begin + i] = bits;
+      sum -= diffs[i];
+    }
   }
 }
 
@@ -160,81 +140,56 @@ static __global__ __launch_bounds__(TPB, 2)
 #endif
 void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, int* const __restrict__ g_outsize)
 {
-  // allocate shared memory buffer
-  __shared__ long long chunk [3 * (CS / sizeof(long long))];
-  const int last = 3 * (CS / sizeof(long long)) - 2 - WS;
+  // RZE stores four levels of byte bitmaps after WS scan words.
+  constexpr int rze_scratch_bytes = WS * sizeof(int) + 2048 + 256 + 32 + 4;
+  __shared__ long long expanded[CS / sizeof(long long)];
+  __shared__ int scratch[(rze_scratch_bytes + sizeof(int) - 1) / sizeof(int)];
+  __shared__ int carry[WS];
+  __shared__ int next_chunk;
 
-  // input header
-  long long* const head_in = (long long*)input;
-  float* const head_in_f = (float*)&head_in[1];
-  const int outsize = (int)head_in[0];
-  const float errorbound = head_in_f[0];
+  const auto* head_in = reinterpret_cast<const long long*>(input);
+  const int outsize = static_cast<int>(head_in[0]);
+  const float eb2 = 2 * reinterpret_cast<const float*>(&head_in[1])[0];
+  const int chunks = (outsize + CS - 1) / CS;
+  const auto* size_in = reinterpret_cast<const unsigned short*>(&head_in[2]);
+  const auto* data_in = reinterpret_cast<const byte*>(&size_in[chunks]);
+  auto* expanded_bytes = reinterpret_cast<byte*>(expanded);
+  auto* scratch_bytes = reinterpret_cast<byte*>(scratch);
 
-  // initialize
-  const int chunks = (outsize + CS - 1) / CS;  // round up
-  unsigned short* const size_in = (unsigned short*)&head_in[2];
-  byte* const data_in = (byte*)&size_in[chunks];
-
-  // loop over chunks
   const int tid = threadIdx.x;
-  int prevChunkID = 0;
-  int prevOffset = 0;
-  do {
-    // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
-    __syncthreads();  // chunk[last] produced, chunk consumed
+  int prev_chunk = 0;
+  int prev_offset = 0;
+  while (true) {
+    if (tid == 0) next_chunk = atomicAdd(&g_chunk_counter, 1);
+    __syncthreads();
 
-    // terminate if done
-    const int chunkID = chunk[last];
-    const int base = chunkID * CS;
+    const int chunk_id = next_chunk;
+    const int base = chunk_id * CS;
     if (base >= outsize) break;
 
-    // compute sum of all prior csizes (start where left off in previous iteration)
     int sum = 0;
-    for (int i = prevChunkID + tid; i < chunkID; i += TPB) {
-      sum += (int)size_in[i];
+    for (int i = prev_chunk + tid; i < chunk_id; i += TPB) {
+      sum += static_cast<int>(size_in[i]);
     }
-    int csize = (int)size_in[chunkID];
-    const int offs = prevOffset + block_sum_reduction(sum, (int*)&chunk[last + 1]);
-    prevChunkID = chunkID;
-    prevOffset = offs;
+    const int offset = prev_offset + block_sum_reduction(sum, carry);
+    prev_chunk = chunk_id;
+    prev_offset = offset;
 
-    // create the 3 shared memory buffers
-    byte* in = (byte*)&chunk[0 * (CS / sizeof(long long))];
-    byte* out = (byte*)&chunk[1 * (CS / sizeof(long long))];
-    byte* temp = (byte*)&chunk[2 * (CS / sizeof(long long))];
-
-    // load chunk
-    g2s(in, &data_in[offs], csize, out);
-    byte* tmp = in; in = out; out = tmp;
-    __syncthreads();  // chunk produced, chunk[last] consumed
-
-    // decode
-    const int osize = min(CS, outsize - base);
-    if (csize < osize) {
-      byte* tmp;
-      tmp = in; in = out; out = tmp;
-      d_iRZE_1(csize, in, out, temp);
+    int stored = static_cast<int>(size_in[chunk_id]);
+    const int raw_size = min(CS, outsize - base);
+    const byte* source = &data_in[offset];
+    byte* destination = &output[base];
+    if (stored < raw_size) {
+      d_iRZE_1(stored, source, expanded_bytes, scratch_bytes);
       __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iBIT_4(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iDIFFNB_4(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iQABS_4(csize, in, out, errorbound);
-      __syncthreads();
-     }
-
-    long long* const output_l = (long long*)&output[base];
-    long long* const out_l = (long long*)out;
-    for (int i = tid; i < osize / 8; i += TPB) {
-      output_l[i] = out_l[i];
+      d_iBIT_4(stored, expanded_bytes, destination, scratch_bytes);
+      __syncthreads();  // Publish inverse-bit words to the threads owning their contiguous ranges.
+      restore_diff_quant(destination, stored, scratch, eb2);
+    } else {
+      copy_raw_chunk(source, destination, raw_size);
     }
-    const int extra = osize % 8;
-    if (tid < extra) output[base + osize - extra + tid] = out[osize - extra + tid];
-  } while (true);
+    __syncthreads();  // A subsequent chunk reuses this block's shared buffers.
+  }
 
   if ((blockIdx.x == 0) && (tid == 0)) {
     *g_outsize = outsize;
