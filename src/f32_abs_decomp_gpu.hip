@@ -203,7 +203,7 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
     const byte* source = &data_in[offset];
     byte* destination = &output[base];
     if (stored < raw_size) {
-      d_iRZE_1(stored, source, expanded_bytes, scratch_bytes);
+      d_iRZE_1_warp_upper(stored, source, expanded_bytes, scratch_bytes);
       __syncthreads();
       if (stored == CS) {
         inverse_bit_full_chunk(expanded_bytes);

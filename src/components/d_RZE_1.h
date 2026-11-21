@@ -56,3 +56,10 @@ static __device__ inline void d_iRZE_1(int& csize, const byte in [CS], byte out 
 {
   d_iRZE<byte>(csize, in, out, temp);
 }
+
+
+
+static __device__ inline void d_iRZE_1_warp_upper(int& csize, const byte in [CS], byte out [CS], byte temp [CS])
+{
+  d_iRZE<byte, true>(csize, in, out, temp);
+}

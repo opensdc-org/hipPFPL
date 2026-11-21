@@ -346,7 +346,7 @@ static __device__ inline bool d_DIFFNB_BIT_ZE_4_full_chunk(int& csize, byte* sla
       slab[pos++] = transformed[i / word_bytes] >> ((i % word_bytes) * 8);
     }
   }
-  return d_RZE_finish<byte>(csize, slab, slab, reinterpret_cast<byte*>(scratch), scratch[WS]);
+  return d_RZE_finish<byte, true>(csize, slab, slab, reinterpret_cast<byte*>(scratch), scratch[WS]);
 }
 
 
