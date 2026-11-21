@@ -46,6 +46,8 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 
 
 #include <cmath>
+#include <limits>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <cassert>
@@ -53,8 +55,7 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #include <hip/hip_runtime.h>
 #include <sys/time.h>
 #include "include/macros.h"
-#include "include/sum_reduction.h"
-#include "include/prefix_sum.h"
+#include "include/chunk_offsets.h"
 #include "components/d_BIT_4.h"
 #include "components/d_RZE_1.h"
 
@@ -65,9 +66,14 @@ const int NUM_RUNS = 9;
 static __device__ int g_chunk_counter;
 
 
-static __global__ void d_reset()
+static __global__ __launch_bounds__(TPB)
+void d_chunk_offsets(const byte* input, int chunks, int* offsets)
 {
-  g_chunk_counter = 0;
+  const auto* sizes = reinterpret_cast<const unsigned short*>(input + 16);
+  __shared__ unsigned int scan_scratch[WS];
+  __shared__ unsigned int tile_total;
+  if (threadIdx.x == 0) g_chunk_counter = 0;
+  scan_chunk_offsets<false>(sizes, chunks, offsets, 0, scan_scratch, tile_total);
 }
 
 
@@ -165,42 +171,32 @@ static __global__ __launch_bounds__(TPB, 3)
 #else
 static __global__ __launch_bounds__(TPB, 2)
 #endif
-void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, int* const __restrict__ g_outsize)
+void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output,
+    int* const __restrict__ g_outsize, const int* const __restrict__ offsets, const int chunks)
 {
   // RZE stores four levels of byte bitmaps after WS scan words.
   constexpr int rze_scratch_bytes = WS * sizeof(int) + 2048 + 256 + 32 + 4;
   __shared__ long long expanded[CS / sizeof(long long)];
   __shared__ int scratch[(rze_scratch_bytes + sizeof(int) - 1) / sizeof(int)];
-  __shared__ int carry[WS];
   __shared__ int next_chunk;
 
   const auto* head_in = reinterpret_cast<const long long*>(input);
   const int outsize = static_cast<int>(head_in[0]);
   const float eb2 = 2 * reinterpret_cast<const float*>(&head_in[1])[0];
-  const int chunks = (outsize + CS - 1) / CS;
   const auto* size_in = reinterpret_cast<const unsigned short*>(&head_in[2]);
   const auto* data_in = reinterpret_cast<const byte*>(&size_in[chunks]);
   auto* expanded_bytes = reinterpret_cast<byte*>(expanded);
   auto* scratch_bytes = reinterpret_cast<byte*>(scratch);
 
   const int tid = threadIdx.x;
-  int prev_chunk = 0;
-  int prev_offset = 0;
   while (true) {
     if (tid == 0) next_chunk = atomicAdd(&g_chunk_counter, 1);
     __syncthreads();
 
     const int chunk_id = next_chunk;
+    if (chunk_id >= chunks) break;
     const int base = chunk_id * CS;
-    if (base >= outsize) break;
-
-    int sum = 0;
-    for (int i = prev_chunk + tid; i < chunk_id; i += TPB) {
-      sum += static_cast<int>(size_in[i]);
-    }
-    const int offset = prev_offset + block_sum_reduction(sum, carry);
-    prev_chunk = chunk_id;
-    prev_offset = offset;
+    const int offset = offsets[chunk_id];
 
     int stored = static_cast<int>(size_in[chunk_id]);
     const int raw_size = min(CS, outsize - base);
@@ -261,14 +257,24 @@ int main(int argc, char* argv [])
 
   // read input file
   FILE* const fin = fopen(argv[1], "rb");
+  if (!fin) throw std::runtime_error("Cannot open encoded file");
   int pre_size = 0;
-  const int pre_val = fread(&pre_size, sizeof(pre_size), 1, fin); assert(pre_val == sizeof(pre_size));
-  fseek(fin, 0, SEEK_END);
-  const int hencsize = ftell(fin);  assert(hencsize > 0);
-  byte* const hencoded = new byte [pre_size];
-  fseek(fin, 0, SEEK_SET);
-  const int insize = fread(hencoded, 1, hencsize, fin);  assert(insize == hencsize);
+  bool header_ok = fread(&pre_size, sizeof(pre_size), 1, fin) == 1;
+  header_ok = header_ok && fseek(fin, 0, SEEK_END) == 0;
+  const long file_size = header_ok ? ftell(fin) : 0;
+  const int chunks = pre_size > 0 ? 1 + (pre_size - 1) / CS : 0;
+  if (chunks == 0 || file_size < 16 + 2 * chunks ||
+      file_size > std::numeric_limits<int>::max() || fseek(fin, 0, SEEK_SET) != 0) {
+    fclose(fin);
+    throw std::runtime_error("Invalid encoded file size");
+  }
+  const int insize = static_cast<int>(file_size);
+  // An all-raw packet can be larger than the reconstructed file.
+  std::unique_ptr<byte[]> hencoded(new byte[insize]);
+  const auto bytes_read = fread(hencoded.get(), 1, insize, fin);
   fclose(fin);
+  if (bytes_read != static_cast<std::size_t>(insize))
+    throw std::runtime_error("Cannot read encoded file");
   printf("encoded size: %d bytes\n", insize);
 
   // get GPU info
@@ -286,11 +292,15 @@ int main(int argc, char* argv [])
   hipHostMalloc((void **)&ddecoded, pre_size);
   byte* d_encoded;
   hipMalloc((void **)&d_encoded, insize);
-  hipMemcpy(d_encoded, hencoded, insize, hipMemcpyHostToDevice);
+  hipMemcpy(d_encoded, hencoded.get(), insize, hipMemcpyHostToDevice);
+  hencoded.reset();
   byte* d_decoded;
   hipMalloc((void **)&d_decoded, pre_size);
   int* d_decsize;
   hipMalloc((void **)&d_decsize, sizeof(int));
+  int* d_offsets;
+  const auto offset_alloc = hipMalloc((void **)&d_offsets, sizeof(int) * chunks);
+  if (offset_alloc != hipSuccess) throw std::runtime_error(hipGetErrorString(offset_alloc));
   CheckHip(__LINE__);
 
   // time GPU decoding
@@ -300,8 +310,8 @@ int main(int argc, char* argv [])
     hipDeviceSynchronize();
     dtimer.start();
 
-    d_reset<<<1, 1>>>();
-    d_decode<<<blocks, TPB>>>(d_encoded, d_decoded, d_decsize);
+    d_chunk_offsets<<<1, TPB>>>(d_encoded, chunks, d_offsets);
+    d_decode<<<blocks, TPB>>>(d_encoded, d_decoded, d_decsize, d_offsets, chunks);
 
     hipDeviceSynchronize();
     double runtime = dtimer.stop();
@@ -330,6 +340,7 @@ int main(int argc, char* argv [])
   hipFree(d_encoded);
   hipFree(d_decoded);
   hipFree(d_decsize);
+  hipFree(d_offsets);
   CheckHip(__LINE__);
 
   // clean up

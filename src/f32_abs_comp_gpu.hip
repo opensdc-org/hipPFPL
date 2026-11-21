@@ -47,6 +47,8 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 
 #include <string>
 #include <cmath>
+#include <climits>
+#include <cstddef>
 #include <cassert>
 #include <stdexcept>
 #include <hip/hip_runtime.h>
@@ -54,7 +56,7 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #include "include/macros.h"
 #include "include/sum_reduction.h"
 #include "include/max_scan.h"
-#include "include/prefix_sum.h"
+#include "include/chunk_offsets.h"
 #include "components/d_BIT_4.h"
 #include "components/d_RZE_1.h"
 
@@ -103,15 +105,6 @@ static inline __device__ void s2g(void* const __restrict__ destination, const vo
       }
     }
   }
-}
-
-
-static __device__ int g_chunk_counter;
-
-
-static __global__ void d_reset()
-{
-  g_chunk_counter = 0;
 }
 
 
@@ -242,7 +235,8 @@ static __global__ __launch_bounds__(TPB, 3)
 #else
 static __global__ __launch_bounds__(TPB, 2)
 #endif
-void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, const float errorbound, const float threshold)
+void d_encode_legacy(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, int* const next_chunk_counter,
+                     const float errorbound, const float threshold)
 {
   // The byte-RZE bitmap follows WS+1 scan words in the shared scratch.
   constexpr int scratch_bytes = (WS + 1) * sizeof(int) + 2048 + 256 + 32 + 4;
@@ -254,13 +248,13 @@ void d_encode(const byte* const __restrict__ input, const int insize, byte* cons
   auto* slab = reinterpret_cast<byte*>(chunk);
   auto* scratch_data = reinterpret_cast<byte*>(scratch);
   const int tid = threadIdx.x;
-  const int chunks = (insize + CS - 1) / CS;
+  const int chunks = 1 + (insize - 1) / CS;
   auto* head_out = reinterpret_cast<long long*>(output);
   auto* size_out = reinterpret_cast<unsigned short*>(&head_out[2]);
   auto* data_out = reinterpret_cast<byte*>(&size_out[chunks]);
 
   while (true) {
-    if (tid == 0) next_chunk = atomicAdd(&g_chunk_counter, 1);
+    if (tid == 0) next_chunk = atomicAdd(next_chunk_counter, 1);
     __syncthreads();
     const int chunk_id = next_chunk;
     if (chunk_id >= chunks) break;
@@ -292,8 +286,205 @@ void d_encode(const byte* const __restrict__ input, const int insize, byte* cons
     if (tid == 0 && chunk_id == chunks - 1) {
       head_out[0] = static_cast<long long>(insize);
       reinterpret_cast<float*>(&head_out[1])[0] = errorbound;
-      *outsize = &data_out[fullcarry[chunk_id]] - output;
+      reinterpret_cast<unsigned int*>(output)[3] = 0;
+      const long long total = &data_out[fullcarry[chunk_id]] - output;
+      *outsize = (total <= INT_MAX) ? static_cast<int>(total) : 0;
     }
+  }
+}
+
+
+// Bound staging to 64 MiB regardless of the input size. Every window is
+// completed in stream order before its slots and offsets can be reused.
+static constexpr int STAGED_CHUNK_LIMIT = 4096;
+
+
+static __global__ __launch_bounds__(TPB, 2)
+void d_encode_staged(const byte* const __restrict__ input, const int insize,
+                     const int first, byte* const __restrict__ staging,
+                     unsigned short* const __restrict__ lengths,
+                     const float errorbound, const float threshold)
+{
+  constexpr int scratch_bytes = (WS + 1) * sizeof(int) + 2048 + 256 + 32 + 4;
+  static_assert(scratch_bytes % sizeof(int) == 0);
+  __shared__ long long chunk[CS / sizeof(long long)];
+  __shared__ int scratch[scratch_bytes / sizeof(int)];
+  auto* slab = reinterpret_cast<byte*>(chunk);
+
+  const int slot = blockIdx.x;
+  const int chunk_id = first + slot;
+  const int base = chunk_id * CS;
+  const int raw_size = min(CS, insize - base);
+  load_raw_chunk(&input[base], slab, raw_size);
+  __syncthreads();
+  d_QABS_4_in_place(raw_size, slab, errorbound, threshold);
+  __syncthreads();
+  d_DIFFNB_BIT_4_in_place(raw_size, slab);
+  __syncthreads();
+
+  int csize = raw_size;
+  const bool good = d_RZE_1_in_place(csize, slab, reinterpret_cast<byte*>(scratch));
+  __syncthreads();
+  if (!good || csize >= raw_size) csize = raw_size;
+  if (threadIdx.x == 0) lengths[chunk_id] = static_cast<unsigned short>(csize);
+
+  // Raw fallback is packed from the original input, so its slot is unused.
+  if (csize < raw_size) {
+    byte* slot_data = &staging[slot * CS];
+    s2g(slot_data, slab, csize);
+    // A later unaligned word copy can load up to the next 4-byte boundary.
+    const int padding = (4 - (csize & 3)) & 3;
+    if (threadIdx.x < padding) slot_data[csize + threadIdx.x] = 0;
+  }
+}
+
+
+static __global__ __launch_bounds__(TPB)
+void d_scan_staged_offsets(const unsigned short* const __restrict__ lengths,
+                           const int first, const int count, const int chunks,
+                           const int insize, const float errorbound,
+                           int* const __restrict__ offsets, byte* const output,
+                           int* const __restrict__ outsize)
+{
+  const int directory_bytes = 16 + 2 * chunks;
+  // A zero from an earlier window is sticky. A prior submission is ignored
+  // when starting a new packet, so no outsize reset kernel is required.
+  if (first != 0 && *outsize <= 0) return;
+  int payload_bytes = (first == 0) ? 0 : *outsize - directory_bytes;
+
+  static_assert(STAGED_CHUNK_LIMIT % 4 == 0);
+  __shared__ unsigned int scan_scratch[WS];
+  __shared__ unsigned int tile_total;
+  payload_bytes = scan_chunk_offsets<true>(lengths + first, count, offsets, payload_bytes,
+                                           scan_scratch, tile_total);
+
+  if (threadIdx.x == 0) {
+    if (first == 0) {
+      reinterpret_cast<long long*>(output)[0] = insize;
+      reinterpret_cast<float*>(output)[2] = errorbound;
+      reinterpret_cast<unsigned int*>(output)[3] = 0;
+    }
+    const long long total = static_cast<long long>(directory_bytes) + payload_bytes;
+    *outsize = (total <= INT_MAX) ? static_cast<int>(total) : 0;
+  }
+}
+
+
+static __global__ __launch_bounds__(TPB)
+void d_pack_staged(const byte* const __restrict__ input, const int insize,
+                   const int first, const int chunks, const byte* const __restrict__ staging,
+                   const int* const __restrict__ offsets, const unsigned short* const __restrict__ lengths,
+                   byte* const output, const int* const __restrict__ outsize)
+{
+  if (*outsize <= 0) return;
+  const int slot = blockIdx.x;
+  const int chunk_id = first + slot;
+  const int base = chunk_id * CS;
+  const int raw_size = min(CS, insize - base);
+  const int length = lengths[chunk_id];
+  const bool raw = (length == raw_size);
+  const byte* source = raw ? &input[base] : &staging[slot * CS];
+  auto* destination = &output[16 + 2 * chunks + offsets[slot]];
+
+  if (raw && (length & 3)) {
+    // Do not read a partial terminal word past the original input allocation.
+    for (int i = threadIdx.x; i < length; i += TPB) destination[i] = source[i];
+  } else {
+    s2g(destination, source, length);
+  }
+}
+
+
+// staging and offsets hold min(number of chunks, STAGED_CHUNK_LIMIT) slots.
+// output has room for the 16-byte header, a u16 per chunk, and insize bytes.
+static void submit_staged_encode(const byte* input, int insize, byte* output, int* outsize,
+                                 byte* staging, int* offsets, float errorbound, float threshold,
+                                 hipStream_t stream = nullptr)
+{
+  const int chunks = 1 + (insize - 1) / CS;
+  auto* lengths = reinterpret_cast<unsigned short*>(output + 16);
+  for (int first = 0; first < chunks; first += STAGED_CHUNK_LIMIT) {
+    const int remaining = chunks - first;
+    const int count = (remaining < STAGED_CHUNK_LIMIT) ? remaining : STAGED_CHUNK_LIMIT;
+    d_encode_staged<<<count, TPB, 0, stream>>>(input, insize, first, staging, lengths, errorbound, threshold);
+    d_scan_staged_offsets<<<1, TPB, 0, stream>>>(lengths, first, count, chunks, insize, errorbound,
+                                                offsets, output, outsize);
+    d_pack_staged<<<count, TPB, 0, stream>>>(input, insize, first, chunks, staging, offsets, lengths,
+                                          output, outsize);
+  }
+}
+
+
+static void check_compression_hip(hipError_t status, const char* operation)
+{
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
+  }
+}
+
+
+struct EncodeScratch
+{
+  explicit EncodeScratch(int insize)
+  {
+    const int chunks = 1 + (insize - 1) / CS;
+    const int cap = (chunks < STAGED_CHUNK_LIMIT) ? chunks : STAGED_CHUNK_LIMIT;
+    // Align the offsets following the staging area for grouped int4 stores.
+    constexpr std::size_t offset_alignment = alignof(int4);
+    const std::size_t aligned_input = (static_cast<std::size_t>(insize) + offset_alignment - 1)
+                                   & ~(offset_alignment - 1);
+    const std::size_t window_bytes = static_cast<std::size_t>(cap) * CS;
+    staging_bytes = (aligned_input < window_bytes) ? aligned_input : window_bytes;
+
+    // One allocation owns both the aligned packet slots and the int offsets.
+    void* allocated = nullptr;
+    const auto status = hipMalloc(&allocated, staging_bytes + static_cast<std::size_t>(cap) * sizeof(int));
+    if (status == hipSuccess) {
+      storage = allocated;
+      return;
+    }
+    if (status != hipErrorOutOfMemory) check_compression_hip(status, "allocate staged compression scratch");
+    // Only the expected out-of-memory result selects the small fallback.
+    static_cast<void>(hipGetLastError());
+    allocated = nullptr;
+    staging_bytes = 0;
+    check_compression_hip(hipMalloc(&allocated, static_cast<std::size_t>(chunks + 1) * sizeof(int)),
+                          "allocate fallback compression scratch");
+    storage = allocated;
+  }
+
+  EncodeScratch(const EncodeScratch&) = delete;
+  EncodeScratch& operator=(const EncodeScratch&) = delete;
+  ~EncodeScratch() { static_cast<void>(hipFree(storage)); }
+
+  void* storage = nullptr;
+  std::size_t staging_bytes = 0;
+};
+
+
+static void submit_legacy_encode(const byte* input, int insize, byte* output, int* outsize,
+                                 int* carry, int blocks, float errorbound, float threshold,
+                                 hipStream_t stream = nullptr)
+{
+  const int chunks = 1 + (insize - 1) / CS;
+  check_compression_hip(hipMemsetAsync(carry, 0, static_cast<std::size_t>(chunks + 1) * sizeof(int), stream),
+                        "initialize fallback compression scratch");
+  d_encode_legacy<<<blocks, TPB, 0, stream>>>(input, insize, output, outsize, carry, carry + chunks,
+                                            errorbound, threshold);
+}
+
+
+static void submit_encode(const byte* input, int insize, byte* output, int* outsize,
+                          const EncodeScratch& scratch, int legacy_blocks,
+                          float errorbound, float threshold, hipStream_t stream = nullptr)
+{
+  if (scratch.staging_bytes) {
+    auto* staging = static_cast<byte*>(scratch.storage);
+    auto* offsets = reinterpret_cast<int*>(staging + scratch.staging_bytes);
+    submit_staged_encode(input, insize, output, outsize, staging, offsets, errorbound, threshold, stream);
+  } else {
+    submit_legacy_encode(input, insize, output, outsize, static_cast<int*>(scratch.storage),
+                         legacy_blocks, errorbound, threshold, stream);
   }
 }
 
@@ -343,25 +534,22 @@ int main(int argc, char* argv [])
   hipDeviceProp_t deviceProp;
   hipGetDeviceProperties(&deviceProp, 0);
   if ((deviceProp.major == 9999) && (deviceProp.minor == 9999)) {fprintf(stderr, "ERROR: no HIP capable device detected\n\n"); throw std::runtime_error("LC error");}
-  const int SMs = deviceProp.multiProcessorCount;
-  const int mTpSM = deviceProp.maxThreadsPerMultiProcessor;
-  const int blocks = SMs * (mTpSM / TPB);
-  const int chunks = (insize + CS - 1) / CS;  // round up
+  const int chunks = 1 + (insize - 1) / CS;
+  const int legacy_blocks = deviceProp.multiProcessorCount * (deviceProp.maxThreadsPerMultiProcessor / TPB);
   CheckHip(__LINE__);
-  const int maxsize = 3 * sizeof(int) + chunks * sizeof(short) + chunks * CS;
+  const std::size_t maxsize = 16 + 2 * static_cast<std::size_t>(chunks) + insize;
 
   // allocate GPU memory
   byte* dencoded;
-  hipHostMalloc((void **)&dencoded, maxsize);
+  check_compression_hip(hipHostMalloc((void**)&dencoded, maxsize), "allocate host packet buffer");
   byte* d_input;
-  hipMalloc((void **)&d_input, insize);
-  hipMemcpy(d_input, input, insize, hipMemcpyHostToDevice);
+  check_compression_hip(hipMalloc((void**)&d_input, insize), "allocate compression input");
+  check_compression_hip(hipMemcpy(d_input, input, insize, hipMemcpyHostToDevice), "transfer compression input");
   byte* d_encoded;
-  hipMalloc((void **)&d_encoded, maxsize);
+  check_compression_hip(hipMalloc((void**)&d_encoded, maxsize), "allocate compression packet buffer");
   int* d_encsize;
-  hipMalloc((void **)&d_encsize, sizeof(int));
-  int* d_fullcarry;
-  hipMalloc((void**)&d_fullcarry, chunks * sizeof(int));
+  check_compression_hip(hipMalloc((void**)&d_encsize, sizeof(int)), "allocate packet size");
+  const EncodeScratch scratch(insize);
   CheckHip(__LINE__);
 
   const float errorbound = atof(argv[3]);
@@ -372,9 +560,8 @@ int main(int argc, char* argv [])
     hipDeviceSynchronize();
     dtimer.start();
 
-    d_reset<<<1, 1>>>();
-    hipMemset(d_fullcarry, 0, chunks * sizeof(int));
-    d_encode<<<blocks, TPB>>>(d_input, insize, d_encoded, d_encsize, d_fullcarry, errorbound, threshold);
+    submit_encode(d_input, insize, d_encoded, d_encsize, scratch, legacy_blocks,
+                  errorbound, threshold);
 
     hipDeviceSynchronize();
     double runtime = dtimer.stop();
@@ -390,6 +577,10 @@ int main(int argc, char* argv [])
   // get encoded GPU result
   int dencsize = 0;
   hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost);
+  if (dencsize <= 0 || static_cast<std::size_t>(dencsize) > maxsize) {
+    fprintf(stderr, "ERROR: encoded packet size is outside the supported range\n\n");
+    throw std::runtime_error("LC error");
+  }
   hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost);
   printf("encoded size: %d bytes\n", dencsize);
   printf("compression ratio: %.2f\n", 1.0 * insize / dencsize);

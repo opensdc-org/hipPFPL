@@ -50,6 +50,7 @@ struct DeviceBuffers {
   int* carry = nullptr;
   int* offsets = nullptr;
   int* visits = nullptr;
+  int* next_chunk = nullptr;
 };
 
 std::string quote_json(const std::string& value) {
@@ -120,7 +121,7 @@ int input_size(int index, const std::string& pattern) {
 // carry protocol itself is the included production propagate_carry function.
 static __global__ __launch_bounds__(TPB, 2)
 void run_production_carry(const int* sizes, int count, int* fullcarry,
-                          int* exclusive_offsets, int* visits) {
+                          int* exclusive_offsets, int* visits, int* next_chunk) {
   __shared__ long long chunk[3 * (CS / sizeof(long long))];
   volatile long long* const initialize_chunk = chunk;
   const int tid = threadIdx.x;
@@ -132,7 +133,7 @@ void run_production_carry(const int* sizes, int count, int* fullcarry,
   __syncthreads();
 
   do {
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
+    if (tid == 0) chunk[last] = atomicAdd(next_chunk, 1);
     __syncthreads();
     const int chunk_id = static_cast<int>(chunk[last]);
     if (chunk_id >= count) break;
@@ -195,11 +196,10 @@ void run_case(const DeviceBuffers& device, CaseResult& result) {
   check_hip(hipMemcpy(device.offsets, offsets.data(), bytes, hipMemcpyHostToDevice), "offsets H2D");
   check_hip(hipMemcpy(device.visits, visits.data(), bytes, hipMemcpyHostToDevice), "visits H2D");
 
-  d_reset<<<1, 1>>>();
-  check_hip(hipGetLastError(), "production d_reset launch");
+  check_hip(hipMemsetAsync(device.next_chunk, 0, sizeof(int), nullptr), "initialize chunk counter");
   run_production_carry<<<spec.blocks, TPB>>>(device.sizes + 1, spec.chunks,
                                           device.carry + 1, device.offsets + 1,
-                                          device.visits + 1);
+                                          device.visits + 1, device.next_chunk);
   check_hip(hipGetLastError(), "production carry test launch");
   result.launched = true;
   check_hip(hipDeviceSynchronize(), "production carry test synchronize");
@@ -209,8 +209,8 @@ void run_case(const DeviceBuffers& device, CaseResult& result) {
   std::vector<int> observed_sizes(entries);
   check_hip(hipMemcpy(observed_sizes.data(), device.sizes, bytes, hipMemcpyDeviceToHost),
             "sizes immutable D2H");
-  check_hip(hipMemcpyFromSymbol(&result.observed_counter, HIP_SYMBOL(g_chunk_counter),
-                                sizeof(int), 0, hipMemcpyDeviceToHost), "chunk counter D2H");
+  check_hip(hipMemcpy(&result.observed_counter, device.next_chunk, sizeof(int), hipMemcpyDeviceToHost),
+            "chunk counter D2H");
 
   for (int index = 0; index < spec.chunks; ++index) {
     mismatch(result, "exclusive_offset", index, expected_offsets[index], offsets[index + 1]);
@@ -302,6 +302,7 @@ int main(int argc, char** argv) {
     check_hip(hipMalloc(reinterpret_cast<void**>(&device.carry), allocation_bytes), "hipMalloc carry");
     check_hip(hipMalloc(reinterpret_cast<void**>(&device.offsets), allocation_bytes), "hipMalloc offsets");
     check_hip(hipMalloc(reinterpret_cast<void**>(&device.visits), allocation_bytes), "hipMalloc visits");
+    check_hip(hipMalloc(reinterpret_cast<void**>(&device.next_chunk), sizeof(int)), "hipMalloc chunk counter");
 
     for (const CaseSpec& spec : cases) {
       std::cerr << "BEGIN carry chunks=" << spec.chunks << " blocks=" << spec.blocks
@@ -319,6 +320,7 @@ int main(int argc, char** argv) {
     std::cerr << "ERROR carry: " << error.what() << std::endl;
   }
 
+  free_checked(device.next_chunk, "hipFree chunk counter", errors);
   free_checked(device.visits, "hipFree visits", errors);
   free_checked(device.offsets, "hipFree offsets", errors);
   free_checked(device.carry, "hipFree carry", errors);
