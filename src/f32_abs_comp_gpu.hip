@@ -55,7 +55,6 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #include "include/sum_reduction.h"
 #include "include/max_scan.h"
 #include "include/prefix_sum.h"
-#include "components/d_DIFFNB_4.h"
 #include "components/d_BIT_4.h"
 #include "components/d_RZE_1.h"
 
@@ -160,55 +159,78 @@ static inline __device__ void propagate_carry(const int value, const int chunkID
 }
 
 
-static __device__ inline void d_QABS_4(int& csize, byte in [CS], byte out [CS], const float errorbound, const float threshold)
+static __device__ inline void load_raw_chunk(const byte* source, byte* slab, int bytes)
 {
-  using ftype = float;
-  using itype = int;
-  const int size = csize / sizeof(ftype);
   const int tid = threadIdx.x;
+  const auto* source_words = reinterpret_cast<const long long*>(source);
+  auto* slab_words = reinterpret_cast<long long*>(slab);
+  for (int i = tid; i < bytes / 8; i += TPB) {
+    slab_words[i] = source_words[i];
+  }
+  const int extra = bytes % 8;
+  if (tid < extra) slab[bytes - extra + tid] = source[bytes - extra + tid];
+}
 
-  const int mantissabits = 23;
-  const itype maxbin = 1 << (mantissabits - 1);  // leave 1 bit for sign
 
-  const ftype eb2 = 2 * errorbound;
-  const ftype inv_eb2 = 0.5f / errorbound;
+static __device__ inline void d_QABS_4_in_place(int csize, byte* slab, float errorbound, float threshold)
+{
+  const int words = csize / sizeof(float);
+  const int maxbin = 1 << 22;  // Leave one mantissa bit for sign.
+  const float eb2 = 2 * errorbound;
+  const float inv_eb2 = 0.5f / errorbound;
+  auto* values = reinterpret_cast<unsigned int*>(slab);
 
-  const ftype* const data_f = (ftype*)in;
-  itype* const data_i = (itype*)out;
+  for (int i = threadIdx.x; i < words; i += TPB) {
+    const unsigned int original_bits = values[i];
+    const float original = __uint_as_float(original_bits);
+    const float scaled = original * inv_eb2;
+    const int bin = static_cast<int>(roundf(scaled));
+    const float reconstructed = bin * eb2;
 
-  for (int i = tid; i < size; i += TPB) {
-    const ftype orig_f = data_f[i];
-    const ftype scaled = orig_f * inv_eb2;
-    const itype bin = (itype)roundf(scaled);
-    const ftype recon = bin * eb2;
-
-    itype val;
-    if ((bin >= maxbin) || (bin <= -maxbin) || (fabsf(orig_f) >= threshold) || (fabsf(orig_f - recon) > errorbound) || (orig_f != orig_f)) {  // last check is to handle NaNs
-      val = *((itype*)&orig_f);
+    if ((bin >= maxbin) || (bin <= -maxbin) || (fabsf(original) >= threshold) ||
+        (fabsf(original - reconstructed) > errorbound) || (original != original)) {
+      values[i] = original_bits;
     } else {
-      val = (bin << 1) ^ (bin >> 31);  // TCMS encoding, 'sign' and 'exponent' fields are zero
+      const unsigned int sign = 0u - static_cast<unsigned int>(bin < 0);
+      values[i] = (static_cast<unsigned int>(bin) << 1) ^ sign;
     }
-    data_i[i] = val;
   }
 }
 
 
-static __device__ inline void d_DIFFNB_BIT_4_full_chunk(const byte in [CS], byte out [CS])
+static __device__ inline void d_DIFFNB_BIT_4_in_place(int csize, byte* slab)
 {
   constexpr int width = 32;
-  constexpr int words = CS / sizeof(unsigned int);
-  constexpr unsigned int mask = 0xAAAAAAAAu;
-  static_assert(words % width == 0 && TPB % width == 0);
+  constexpr int words_per_thread = CS / sizeof(unsigned int) / TPB;
+  constexpr unsigned int bias = 0xAAAAAAAAu;
+  static_assert(CS % (sizeof(unsigned int) * TPB) == 0 && TPB % width == 0);
 
-  const auto* const input_words = reinterpret_cast<const unsigned int*>(in);
-  auto* const output_words = reinterpret_cast<unsigned int*>(out);
+  auto* words = reinterpret_cast<unsigned int*>(slab);
+  const int count = csize / sizeof(unsigned int);
+  const int transposed = count - count % width;
   const int tid = threadIdx.x;
   const int lane = tid % width;
-  for (int i = tid; i < words; i += TPB) {
-    const unsigned int previous = (i == 0) ? 0u : input_words[i - 1];
-    const unsigned int delta = input_words[i] - previous;
-    const unsigned int differenced = (delta + mask) ^ mask;
-    output_words[i / width + lane * (words / width)] = d_BIT_4_word(differenced, lane);
+  unsigned int staged[words_per_thread];
+
+  #pragma unroll
+  for (int row = 0; row < words_per_thread; ++row) {
+    const int i = tid + row * TPB;
+    if (i < count) {
+      const unsigned int previous = (i == 0) ? 0u : words[i - 1];
+      const unsigned int diff = ((words[i] - previous) + bias) ^ bias;
+      // In a partial chunk the remaining complete words are differenced
+      // without a bit transpose. Only whole logical warps call the shuffle.
+      staged[row] = (i < transposed) ? d_BIT_4_word(diff, lane) : diff;
+    }
+  }
+  __syncthreads();  // Permuted writes can overlap any lane's old input.
+  #pragma unroll
+  for (int row = 0; row < words_per_thread; ++row) {
+    const int i = tid + row * TPB;
+    if (i < count) {
+      const int out = (i < transposed) ? i / width + lane * (transposed / width) : i;
+      words[out] = staged[row];
+    }
   }
 }
 
@@ -220,101 +242,57 @@ static __global__ __launch_bounds__(TPB, 2)
 #endif
 void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, const float errorbound, const float threshold)
 {
-  // allocate shared memory buffer
-  __shared__ long long chunk [3 * (CS / sizeof(long long))];
+  // The byte-RZE bitmap follows WS+1 scan words in the shared scratch.
+  constexpr int scratch_bytes = (WS + 1) * sizeof(int) + 2048 + 256 + 32 + 4;
+  static_assert(scratch_bytes % sizeof(int) == 0);
+  __shared__ long long chunk[CS / sizeof(long long)];
+  __shared__ int scratch[scratch_bytes / sizeof(int)];
+  __shared__ int next_chunk;
 
-  // split into 3 shared memory buffers
-  byte* in = (byte*)&chunk[0 * (CS / sizeof(long long))];
-  byte* out = (byte*)&chunk[1 * (CS / sizeof(long long))];
-  byte* const temp = (byte*)&chunk[2 * (CS / sizeof(long long))];
-
-  // initialize
+  auto* slab = reinterpret_cast<byte*>(chunk);
+  auto* scratch_data = reinterpret_cast<byte*>(scratch);
   const int tid = threadIdx.x;
-  const int last = 3 * (CS / sizeof(long long)) - 2 - WS;
-  const int chunks = (insize + CS - 1) / CS;  // round up
-  long long* const head_out = (long long*)output;
-  unsigned short* const size_out = (unsigned short*)&head_out[2];
-  byte* const data_out = (byte*)&size_out[chunks];
+  const int chunks = (insize + CS - 1) / CS;
+  auto* head_out = reinterpret_cast<long long*>(output);
+  auto* size_out = reinterpret_cast<unsigned short*>(&head_out[2]);
+  auto* data_out = reinterpret_cast<byte*>(&size_out[chunks]);
 
-  // loop over chunks
-  do {
-    // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
-    __syncthreads();  // chunk[last] produced, chunk consumed
+  while (true) {
+    if (tid == 0) next_chunk = atomicAdd(&g_chunk_counter, 1);
+    __syncthreads();
+    const int chunk_id = next_chunk;
+    if (chunk_id >= chunks) break;
+    const int base = chunk_id * CS;
+    const int raw_size = min(CS, insize - base);
+    const byte* source = &input[base];
 
-    // terminate if done
-    const int chunkID = chunk[last];
-    const int base = chunkID * CS;
-    if (base >= insize) break;
+    load_raw_chunk(source, slab, raw_size);
+    __syncthreads();
+    d_QABS_4_in_place(raw_size, slab, errorbound, threshold);
+    __syncthreads();
+    d_DIFFNB_BIT_4_in_place(raw_size, slab);
+    __syncthreads();
 
-    // load chunk
-    const int osize = min(CS, insize - base);
-    long long* const input_l = (long long*)&input[base];
-    long long* const out_l = (long long*)out;
-    for (int i = tid; i < osize / 8; i += TPB) {
-      out_l[i] = input_l[i];
+    int csize = raw_size;
+    const bool good = d_RZE_1_in_place(csize, slab, scratch_data);
+    __syncthreads();
+
+    if (!good || (csize >= raw_size)) csize = raw_size;
+    propagate_carry(csize, chunk_id, fullcarry, scratch);
+
+    if (tid == 0) size_out[chunk_id] = csize;
+    if (csize == raw_size) load_raw_chunk(source, slab, raw_size);
+    __syncthreads();
+
+    const int offset = (chunk_id == 0) ? 0 : scratch[0];
+    s2g(&data_out[offset], slab, csize);
+
+    if (tid == 0 && chunk_id == chunks - 1) {
+      head_out[0] = static_cast<long long>(insize);
+      reinterpret_cast<float*>(&head_out[1])[0] = errorbound;
+      *outsize = &data_out[fullcarry[chunk_id]] - output;
     }
-    const int extra = osize % 8;
-    if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-
-    // encode chunk
-    __syncthreads();  // chunk produced, chunk[last] consumed
-    int csize = osize;
-    bool good = true;
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_QABS_4(csize, in, out, errorbound, threshold);
-      __syncthreads();
-    }
-    if (good && osize == CS) {
-      byte* tmp = in; in = out; out = tmp;
-      d_DIFFNB_BIT_4_full_chunk(in, out);
-      __syncthreads();
-    } else if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_DIFFNB_4(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_BIT_4(csize, in, out, temp);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      good = d_RZE_1(csize, in, out, temp);
-      __syncthreads();
-    }
-
-    // handle carry
-    if (!good || (csize >= osize)) csize = osize;
-    propagate_carry(csize, chunkID, fullcarry, (int*)temp);
-
-    // reload chunk if incompressible
-    if (tid == 0) size_out[chunkID] = csize;
-    if (csize == osize) {
-      // store original data
-      long long* const out_l = (long long*)out;
-      for (int i = tid; i < osize / 8; i += TPB) {
-        out_l[i] = input_l[i];
-      }
-      const int extra = osize % 8;
-      if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-    }
-    __syncthreads();  // "out" done, temp produced
-
-    // store chunk
-    const int offs = (chunkID == 0) ? 0 : *((int*)temp);
-    s2g(&data_out[offs], out, csize);
-
-    // finalize if last chunk
-    if ((tid == 0) && (base + CS >= insize)) {
-      // output header
-      head_out[0] = (long long)insize;
-      float* const head_out_f = (float*)&head_out[1];
-      head_out_f[0] = errorbound;
-      // compute compressed size
-      *outsize = &data_out[fullcarry[chunkID]] - output;
-    }
-  } while (true);
+  }
 }
 
 

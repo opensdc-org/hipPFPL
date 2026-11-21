@@ -45,7 +45,7 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 #include "d_repetition_elimination.h"
 
 
-template <typename T>
+template <typename T, bool InPlace = false>
 static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byte temp [CS])
 {
   const int tid = threadIdx.x;
@@ -67,7 +67,14 @@ static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byt
 
   // copy non-zero values and generate bitmap
   int wpos = 0;
-  if (size > 0) d_ZEencode((T*)in, size, (T*)out, wpos, (T*)bitmap, temp_w);
+  if (size > 0) {
+    if constexpr (InPlace) {
+      static_assert(std::is_same<T, byte>::value && CS == 16384 && TPB == 512);
+      d_ZEencode_byte_in_place(out, size, wpos, bitmap, temp_w);
+    } else {
+      d_ZEencode((T*)in, size, (T*)out, wpos, (T*)bitmap, temp_w);
+    }
+  }
   wpos *= sizeof(T);
   if (wpos >= avail) return false;
   __syncthreads();

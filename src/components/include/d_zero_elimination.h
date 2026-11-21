@@ -113,6 +113,65 @@ static __device__ inline bool d_ZEencodebyteshort(const T* const in, const int i
 }
 
 
+// The input can be overwritten only after every thread has retained its source words.
+static __device__ inline void d_ZEencode_byte_in_place(byte* data, const int insize,
+                                                       int& datasize, byte* bitmap, int* temp_w)
+{
+  using ull = unsigned long long;
+  constexpr int words_per_thread = 4;
+  constexpr int bytes_per_thread = words_per_thread * sizeof(ull);
+  constexpr int bitmap_bytes_per_thread = bytes_per_thread / 8;
+  const int tid = threadIdx.x;
+  const int begin = tid * bytes_per_thread;
+  const auto* input_words = reinterpret_cast<const ull*>(data);
+  ull staged[words_per_thread] = {};
+  unsigned int bits = 0;
+
+  if (begin < insize) {
+    if (begin + bytes_per_thread <= insize) {
+      #pragma unroll
+      for (int i = 0; i < words_per_thread; ++i) {
+        staged[i] = input_words[tid * words_per_thread + i];
+      }
+    } else {
+      // The last active thread only reads bytes within the partial segment.
+      #pragma unroll
+      for (int i = 0; i < bytes_per_thread; ++i) {
+        if (begin + i < insize) {
+          staged[i / sizeof(ull)] |= static_cast<ull>(data[begin + i]) << ((i % sizeof(ull)) * 8);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < bytes_per_thread; ++i) {
+      const byte value = staged[i / sizeof(ull)] >> ((i % sizeof(ull)) * 8);
+      bits |= static_cast<unsigned int>(value != 0) << i;
+    }
+    #pragma unroll
+    for (int i = 0; i < bitmap_bytes_per_thread; ++i) {
+      bitmap[tid * bitmap_bytes_per_thread + i] = bits >> (i * 8);
+    }
+  }
+
+  const int count = __popc(bits);
+  const int inclusive = block_prefix_sum(count, temp_w);
+  if (tid == TPB - 1) temp_w[WS] = inclusive;
+  __syncthreads();
+
+  int pos = inclusive - count;
+  if (bits != 0) {
+    #pragma unroll
+    for (int i = 0; i < bytes_per_thread; ++i) {
+      if ((bits >> i) & 1u) {
+        data[pos++] = staged[i / sizeof(ull)] >> ((i % sizeof(ull)) * 8);
+      }
+    }
+  }
+  datasize = temp_w[WS];
+}
+
+
 //warp-based one word per thread
 template <typename T, bool check = false>
 static __device__ inline bool d_ZEencode1wordperthread(const T* const in, const int insize, T* const dataout, int& datasize, T* const bmout, int* const temp_w)  // all sizes in number of words

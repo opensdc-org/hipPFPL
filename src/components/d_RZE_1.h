@@ -46,6 +46,12 @@ static __device__ inline bool d_RZE_1(int& csize, byte in [CS], byte out [CS], b
 }
 
 
+static __device__ inline bool d_RZE_1_in_place(int& csize, byte* slab, byte* temp)
+{
+  return d_RZE<byte, true>(csize, slab, slab, temp);
+}
+
+
 static __device__ inline void d_iRZE_1(int& csize, const byte in [CS], byte out [CS], byte temp [CS])
 {
   d_iRZE<byte>(csize, in, out, temp);
