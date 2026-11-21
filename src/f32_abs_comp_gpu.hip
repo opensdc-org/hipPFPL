@@ -210,6 +210,8 @@ static __device__ inline void d_DIFFNB_BIT_4_in_place(int csize, byte* slab)
   const int transposed = count - count % width;
   const int tid = threadIdx.x;
   const int lane = tid % width;
+  // Spread the full chunk's bit-plane stores across LDS banks.
+  const int bank_mask = (csize == CS) ? lane : 0;
   unsigned int staged[words_per_thread];
 
   #pragma unroll
@@ -229,7 +231,7 @@ static __device__ inline void d_DIFFNB_BIT_4_in_place(int csize, byte* slab)
     const int i = tid + row * TPB;
     if (i < count) {
       const int out = (i < transposed) ? i / width + lane * (transposed / width) : i;
-      words[out] = staged[row];
+      words[out ^ bank_mask] = staged[row];
     }
   }
 }

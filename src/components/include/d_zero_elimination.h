@@ -123,6 +123,8 @@ static __device__ inline void d_ZEencode_byte_in_place(byte* data, const int ins
   constexpr int bitmap_bytes_per_thread = bytes_per_thread / 8;
   const int tid = threadIdx.x;
   const int begin = tid * bytes_per_thread;
+  constexpr int bytes_per_bit_plane = CS / 32;
+  const int bank_mask = (insize == CS) ? begin / bytes_per_bit_plane : 0;
   const auto* input_words = reinterpret_cast<const ull*>(data);
   ull staged[words_per_thread] = {};
   unsigned int bits = 0;
@@ -131,7 +133,10 @@ static __device__ inline void d_ZEencode_byte_in_place(byte* data, const int ins
     if (begin + bytes_per_thread <= insize) {
       #pragma unroll
       for (int i = 0; i < words_per_thread; ++i) {
-        staged[i] = input_words[tid * words_per_thread + i];
+        // XOR on the u32 index changes both the u64 slot and the half order.
+        const int index = (tid * words_per_thread + i) ^ (bank_mask >> 1);
+        const ull word = input_words[index];
+        staged[i] = (bank_mask & 1) ? ((word << 32) | (word >> 32)) : word;
       }
     } else {
       // The last active thread only reads bytes within the partial segment.
