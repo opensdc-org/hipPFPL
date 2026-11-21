@@ -319,6 +319,13 @@ static __device__ inline void d_iRZE(int& csize, const byte in [CS], byte out [C
     __syncthreads();
 
     // copy non-zero values based on bitmap
+    if constexpr (WarpUpper) {
+      static_assert(std::is_same<T, byte>::value && CS == 16384 && TPB == 512);
+      if (size == CS) {
+        d_ZEdecode_full_byte_permute(in, rpos, bitmap, out, temp_w);
+        return;
+      }
+    }
     if (size > 0) d_ZEdecode(size, (const T*)in, (T*)bitmap, (T*)out, temp_w);
   }
 }

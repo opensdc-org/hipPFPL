@@ -882,6 +882,111 @@ static __device__ inline void d_ZEdecode_small(const int decsize, const T* const
 }
 
 
+// CUDA/HIP byte-permute selectors. A selector of 4 uses the zero operand.
+static __device__ __constant__ unsigned short d_ZE_byte_selectors[16] = {
+  0x4444, 0x4440, 0x4404, 0x4410,
+  0x4044, 0x4140, 0x4104, 0x4210,
+  0x0444, 0x1440, 0x1404, 0x2410,
+  0x1044, 0x2140, 0x2104, 0x3210,
+};
+
+
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__) && (__AMDGCN_WAVEFRONT_SIZE == 64)
+#if __has_builtin(__builtin_amdgcn_ds_swizzle)
+template <int distance>
+static __device__ inline void byte_ze_prefix_step(int lane, int& sum, int& offset)
+{
+  const int neighbor = __builtin_amdgcn_ds_swizzle(sum, 31 | (distance << 10));
+  if (lane & distance) offset += neighbor;
+  sum += neighbor;
+}
+#endif
+#endif
+
+// Each physical wave calculates the total of earlier waves after one
+// publication. LDS holds only the eight wave totals, which are read-only
+// until the caller's barrier after final ZE.
+static __device__ inline int byte_ze_exclusive_offset(int count, int* scratch)
+{
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__) && (__AMDGCN_WAVEFRONT_SIZE == 64)
+#if __has_builtin(__builtin_amdgcn_ds_swizzle)
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave_index = tid / 64;
+  int sum = count;
+  int offset = 0;
+  byte_ze_prefix_step<1>(lane, sum, offset);
+  byte_ze_prefix_step<2>(lane, sum, offset);
+  byte_ze_prefix_step<4>(lane, sum, offset);
+  byte_ze_prefix_step<8>(lane, sum, offset);
+  byte_ze_prefix_step<16>(lane, sum, offset);
+  const int other_half = __shfl_xor_sync(~0ull, sum, 32, 64);
+  if (tid & 32) offset += other_half;
+  if ((tid & 63) == 0) scratch[wave_index] = sum + other_half;
+  __syncthreads();
+
+  // Contributions occupy the first eight lanes of each logical half-wave.
+  if (wave_index != 0) {
+    int prior = lane < wave_index ? scratch[lane] : 0;
+    prior += __builtin_amdgcn_ds_swizzle(prior, 31 | (1 << 10));
+    prior += __builtin_amdgcn_ds_swizzle(prior, 31 | (2 << 10));
+    prior += __builtin_amdgcn_ds_swizzle(prior, 31 | (4 << 10));
+    offset += __builtin_amdgcn_ds_swizzle(prior, 0);
+  }
+  return offset;
+#endif
+#endif
+  return block_prefix_sum(count, scratch) - count;
+}
+
+// Compute packed addresses by rank and expand four consecutive 8-byte output words per thread.
+static __device__ inline void d_ZEdecode_full_byte_permute(const byte* datain, int payload_bytes,
+    const byte* bitmap, byte* out, int* temp_w)
+{
+  constexpr int words_per_thread = 4;
+  const int tid = threadIdx.x;
+  const auto* bitmap_words = reinterpret_cast<const unsigned int*>(bitmap);
+  const unsigned int marks = bitmap_words[tid];
+  const unsigned int count = __popc(marks);
+  const unsigned int end = byte_ze_exclusive_offset(count, temp_w) + count;
+  if (payload_bytes < 0 || end > static_cast<unsigned int>(payload_bytes) ||
+      (tid == TPB - 1 && end != static_cast<unsigned int>(payload_bytes))) {
+    __trap();
+    return;
+  }
+  const int base = static_cast<int>(end - count);
+  auto* output_words = reinterpret_cast<unsigned long long*>(out);
+  #pragma unroll
+  for (int next = 0; next < words_per_thread; ++next) {
+    const unsigned int bm = (marks >> (8 * next)) & 255u;
+    unsigned long long expanded = 0;
+    if (bm != 0) {
+      const unsigned int previous = marks & ((1u << (8 * next)) - 1u);
+      const int pos = base + static_cast<int>(__popc(previous));
+      unsigned long long packed = 0;
+      if (pos <= payload_bytes - 8) {
+        __builtin_memcpy(&packed, datain + pos, sizeof(packed));
+      } else {
+        // Do not read past the byte payload for the final packed word.
+        const int valid = static_cast<int>(__popc(bm));
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          if (i < valid) packed |= static_cast<unsigned long long>(datain[pos + i]) << (8 * i);
+        }
+      }
+      const unsigned int lower = bm & 15u;
+      const unsigned int upper = bm >> 4;
+      const auto lo = __byte_perm(static_cast<unsigned int>(packed), 0u, d_ZE_byte_selectors[lower]);
+      const auto hi = __byte_perm(static_cast<unsigned int>(packed >> (8 * __popc(lower))), 0u,
+                                 d_ZE_byte_selectors[upper]);
+      expanded = static_cast<unsigned long long>(lo) | (static_cast<unsigned long long>(hi) << 32);
+    }
+    output_words[tid * words_per_thread + next] = expanded;
+  }
+}
+
+
 template <typename T, int maxsize = CS>
 static __device__ inline void d_ZEdecode(const int decsize, const T* const datain, const T* const bmin, T* const out, int* const temp_w)  // all sizes in number of words
 {
