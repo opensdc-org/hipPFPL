@@ -113,6 +113,16 @@ static __device__ inline bool d_ZEencodebyteshort(const T* const in, const int i
 }
 
 
+static __device__ inline unsigned int d_nonzero_byte_mask(unsigned int word)
+{
+  constexpr unsigned int low_bits = 0x7f7f7f7fu;
+  constexpr unsigned int high_bits = 0x80808080u;
+  // Mark every nonzero byte without carrying into the next byte, then pack the markers.
+  const unsigned int nonzero = (((word & low_bits) + low_bits) | word) & high_bits;
+  return ((nonzero >> 7) * 0x01020408u) >> 24;
+}
+
+
 // The input can be overwritten only after every thread has retained its source words.
 static __device__ inline void d_ZEencode_byte_in_place(byte* data, const int insize,
                                                        int& datasize, byte* bitmap, int* temp_w)
@@ -149,9 +159,11 @@ static __device__ inline void d_ZEencode_byte_in_place(byte* data, const int ins
     }
 
     #pragma unroll
-    for (int i = 0; i < bytes_per_thread; ++i) {
-      const byte value = staged[i / sizeof(ull)] >> ((i % sizeof(ull)) * 8);
-      bits |= static_cast<unsigned int>(value != 0) << i;
+    for (int i = 0; i < words_per_thread; ++i) {
+      const auto low = static_cast<unsigned int>(staged[i]);
+      const auto high = static_cast<unsigned int>(staged[i] >> 32);
+      const unsigned int byte_mask = d_nonzero_byte_mask(low) | (d_nonzero_byte_mask(high) << 4);
+      bits |= byte_mask << (i * 8);
     }
     #pragma unroll
     for (int i = 0; i < bitmap_bytes_per_thread; ++i) {
