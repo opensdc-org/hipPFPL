@@ -45,37 +45,17 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 #include "d_repetition_elimination.h"
 
 
-template <typename T, bool InPlace = false>
-static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byte temp [CS])
+// Finish the common RZE stream after zero elimination has populated the payload
+// and the first bitmap. wpos is measured in bytes.
+template <typename T>
+static __device__ inline bool d_RZE_finish(int& csize, const byte in [CS],
+                                         byte out [CS], byte temp [CS], int wpos)
 {
   const int tid = threadIdx.x;
-  const int size = csize / sizeof(T);  // words in chunk (rounded down)
   const int extra = csize % sizeof(T);
   const int avail = CS - 2 - extra;
-  const int bits = 8 * sizeof(T);
-  assert(CS == 16384);
-
-  // zero out end of bitmap
   int* const temp_w = (int*)temp;
   byte* const bitmap = (byte*)&temp_w[WS + 1];
-  if (csize < CS) {
-    for (int i = csize / bits + tid; i < CS / bits; i += TPB) {
-      bitmap[i] = 0;
-    }
-    __syncthreads();
-  }
-
-  // copy non-zero values and generate bitmap
-  int wpos = 0;
-  if (size > 0) {
-    if constexpr (InPlace) {
-      static_assert(std::is_same<T, byte>::value && CS == 16384 && TPB == 512);
-      d_ZEencode_byte_in_place(out, size, wpos, bitmap, temp_w);
-    } else {
-      d_ZEencode((T*)in, size, (T*)out, wpos, (T*)bitmap, temp_w);
-    }
-  }
-  wpos *= sizeof(T);
   if (wpos >= avail) return false;
   __syncthreads();
 
@@ -128,6 +108,38 @@ static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byt
   }
   csize = new_size;
   return true;
+}
+
+
+template <typename T, bool InPlace = false>
+static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byte temp [CS])
+{
+  const int tid = threadIdx.x;
+  const int size = csize / sizeof(T);  // words in chunk (rounded down)
+  const int bits = 8 * sizeof(T);
+  assert(CS == 16384);
+
+  // zero out end of bitmap
+  int* const temp_w = (int*)temp;
+  byte* const bitmap = (byte*)&temp_w[WS + 1];
+  if (csize < CS) {
+    for (int i = csize / bits + tid; i < CS / bits; i += TPB) {
+      bitmap[i] = 0;
+    }
+    __syncthreads();
+  }
+
+  // copy non-zero values and generate bitmap
+  int wpos = 0;
+  if (size > 0) {
+    if constexpr (InPlace) {
+      static_assert(std::is_same<T, byte>::value && CS == 16384 && TPB == 512);
+      d_ZEencode_byte_in_place(out, size, wpos, bitmap, temp_w);
+    } else {
+      d_ZEencode((T*)in, size, (T*)out, wpos, (T*)bitmap, temp_w);
+    }
+  }
+  return d_RZE_finish<T>(csize, in, out, temp, wpos * sizeof(T));
 }
 
 

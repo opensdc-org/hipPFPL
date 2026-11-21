@@ -294,6 +294,62 @@ void d_encode_legacy(const byte* const __restrict__ input, const int insize, byt
 }
 
 
+// Fuse the full-chunk bit transpose with byte zero elimination. Each logical
+// warp handles a consecutive span of input, so a lane produces an entire
+// 32-byte segment of one bit plane and can retain it rather than staging it.
+static __device__ inline bool d_DIFFNB_BIT_ZE_4_full_chunk(int& csize, byte* slab,
+                                                          int* scratch, int* counts)
+{
+  static_assert(CS == 16384 && TPB == 512 && WS == 32);
+  constexpr int word_bytes = sizeof(unsigned int);
+  constexpr int rows_per_warp = CS / word_bytes / TPB;
+  constexpr int warps = TPB / WS;
+  constexpr unsigned int bias = 0xAAAAAAAAu;
+  const int tid = threadIdx.x;
+  const int lane = tid % WS;
+  const int warp = tid / WS;
+  const int group = lane * warps + warp;
+  // XOR the low address bits to disperse both the bit-plane-order scan and
+  // the logical-warp-ordered reads and writes across LDS banks.
+  const int scatter_index = group ^ (group / warps);
+  const int scan_index = tid ^ (tid / warps);
+  const auto* words = reinterpret_cast<const unsigned int*>(slab);
+  unsigned int transformed[rows_per_warp];
+  unsigned int bits = 0;
+
+  #pragma unroll
+  for (int row = 0; row < rows_per_warp; ++row) {
+    const int i = (warp * rows_per_warp + row) * WS + lane;
+    const unsigned int previous = (i == 0) ? 0u : words[i - 1];
+    const unsigned int diff = ((words[i] - previous) + bias) ^ bias;
+    const unsigned int word = d_BIT_4_word(diff, lane);
+    transformed[row] = word;
+    bits |= d_nonzero_byte_mask(word) << (4 * row);
+  }
+
+  const int nonzero = __popc(bits);
+  counts[scatter_index] = nonzero;
+  if (tid < WS) scratch[tid] = 0;
+  __syncthreads();  // All counts and all reads of the quantized input are complete.
+  const int group_count = counts[scan_index];
+  const int inclusive = block_prefix_sum(group_count, scratch);
+  counts[scan_index] = inclusive - group_count;
+  if (tid == TPB - 1) scratch[WS] = inclusive;
+  __syncthreads();  // Publish exclusive offsets in bit-plane order.
+
+  auto* bitmap = reinterpret_cast<unsigned int*>(scratch + WS + 1);
+  bitmap[group] = bits;
+  int pos = counts[scatter_index];
+  #pragma unroll
+  for (int i = 0; i < rows_per_warp * word_bytes; ++i) {
+    if ((bits >> i) & 1u) {
+      slab[pos++] = transformed[i / word_bytes] >> ((i % word_bytes) * 8);
+    }
+  }
+  return d_RZE_finish<byte>(csize, slab, slab, reinterpret_cast<byte*>(scratch), scratch[WS]);
+}
+
+
 // Bound staging to 64 MiB regardless of the input size. Every window is
 // completed in stream order before its slots and offsets can be reused.
 static constexpr int STAGED_CHUNK_LIMIT = 4096;
@@ -309,6 +365,7 @@ void d_encode_staged(const byte* const __restrict__ input, const int insize,
   static_assert(scratch_bytes % sizeof(int) == 0);
   __shared__ long long chunk[CS / sizeof(long long)];
   __shared__ int scratch[scratch_bytes / sizeof(int)];
+  __shared__ int counts[TPB];
   auto* slab = reinterpret_cast<byte*>(chunk);
 
   const int slot = blockIdx.x;
@@ -319,11 +376,15 @@ void d_encode_staged(const byte* const __restrict__ input, const int insize,
   __syncthreads();
   d_QABS_4_in_place(raw_size, slab, errorbound, threshold);
   __syncthreads();
-  d_DIFFNB_BIT_4_in_place(raw_size, slab);
-  __syncthreads();
-
   int csize = raw_size;
-  const bool good = d_RZE_1_in_place(csize, slab, reinterpret_cast<byte*>(scratch));
+  bool good;
+  if (raw_size == CS) {
+    good = d_DIFFNB_BIT_ZE_4_full_chunk(csize, slab, scratch, counts);
+  } else {
+    d_DIFFNB_BIT_4_in_place(raw_size, slab);
+    __syncthreads();
+    good = d_RZE_1_in_place(csize, slab, reinterpret_cast<byte*>(scratch));
+  }
   __syncthreads();
   if (!good || csize >= raw_size) csize = raw_size;
   if (threadIdx.x == 0) lengths[chunk_id] = static_cast<unsigned short>(csize);

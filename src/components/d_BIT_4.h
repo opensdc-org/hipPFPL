@@ -37,15 +37,28 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 */
 
 
+template <int mask>
+static __device__ __forceinline__ unsigned int bit_shuffle_xor(unsigned int value)
+{
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+#if __has_builtin(__builtin_amdgcn_ds_swizzle)
+  // Bit mode routes lane XOR independently within each 32-lane half-wave.
+  return __builtin_amdgcn_ds_swizzle(value, 31 | (mask << 10));
+#endif
+#endif
+  return pfpl_shfl_xor(value, mask);
+}
+
+
 static __device__ inline unsigned int d_BIT_4_word(unsigned int a, const int sublane)
 {
-  unsigned int q = pfpl_shfl_xor(a, 16);
+  unsigned int q = bit_shuffle_xor<16>(a);
   a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
 
-  q = pfpl_shfl_xor(a, 8);
+  q = bit_shuffle_xor<8>(a);
   a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
 
-  q = pfpl_shfl_xor(a, 4);
+  q = bit_shuffle_xor<4>(a);
   unsigned int mask = 0x0F0F0F0F;
   if ((sublane & 4) == 0) {
     a = (a & ~mask) | ((q >> 4) & mask);
@@ -53,7 +66,7 @@ static __device__ inline unsigned int d_BIT_4_word(unsigned int a, const int sub
     a = ((q << 4) & ~mask) | (a & mask);
   }
 
-  q = pfpl_shfl_xor(a, 2);
+  q = bit_shuffle_xor<2>(a);
   mask = 0x33333333;
   if ((sublane & 2) == 0) {
     a = (a & ~mask) | ((q >> 2) & mask);
@@ -61,7 +74,7 @@ static __device__ inline unsigned int d_BIT_4_word(unsigned int a, const int sub
     a = ((q << 2) & ~mask) | (a & mask);
   }
 
-  q = pfpl_shfl_xor(a, 1);
+  q = bit_shuffle_xor<1>(a);
   mask = 0x55555555;
   if ((sublane & 1) == 0) {
     a = (a & ~mask) | ((q >> 1) & mask);
@@ -98,13 +111,13 @@ static __device__ inline bool d_BIT_4(int& csize, byte in [CS], byte out [CS], b
 
 static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
 {
-  unsigned int q = pfpl_shfl_xor(a, 16);
+  unsigned int q = bit_shuffle_xor<16>(a);
   a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
 
-  q = pfpl_shfl_xor(a, 8);
+  q = bit_shuffle_xor<8>(a);
   a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
 
-  q = pfpl_shfl_xor(a, 4);
+  q = bit_shuffle_xor<4>(a);
   unsigned int mask = 0x0F0F0F0F;
   if ((sublane & 4) == 0) {
     a = (a & ~mask) | ((q >> 4) & mask);
@@ -112,7 +125,7 @@ static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
     a = (a & mask) | ((q << 4) & ~mask);
   }
 
-  q = pfpl_shfl_xor(a, 2);
+  q = bit_shuffle_xor<2>(a);
   mask = 0x33333333;
   if ((sublane & 2) == 0) {
     a = (a & ~mask) | ((q >> 2) & mask);
@@ -120,7 +133,7 @@ static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
     a = (a & mask) | ((q << 2) & ~mask);
   }
 
-  q = pfpl_shfl_xor(a, 1);
+  q = bit_shuffle_xor<1>(a);
   mask = 0x55555555;
   if ((sublane & 1) == 0) {
     a = (a & ~mask) | ((q >> 1) & mask);
