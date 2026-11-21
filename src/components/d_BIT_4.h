@@ -96,6 +96,41 @@ static __device__ inline bool d_BIT_4(int& csize, byte in [CS], byte out [CS], b
 }
 
 
+static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
+{
+  unsigned int q = pfpl_shfl_xor(a, 16);
+  a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
+
+  q = pfpl_shfl_xor(a, 8);
+  a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
+
+  q = pfpl_shfl_xor(a, 4);
+  unsigned int mask = 0x0F0F0F0F;
+  if ((sublane & 4) == 0) {
+    a = (a & ~mask) | ((q >> 4) & mask);
+  } else {
+    a = (a & mask) | ((q << 4) & ~mask);
+  }
+
+  q = pfpl_shfl_xor(a, 2);
+  mask = 0x33333333;
+  if ((sublane & 2) == 0) {
+    a = (a & ~mask) | ((q >> 2) & mask);
+  } else {
+    a = (a & mask) | ((q << 2) & ~mask);
+  }
+
+  q = pfpl_shfl_xor(a, 1);
+  mask = 0x55555555;
+  if ((sublane & 1) == 0) {
+    a = (a & ~mask) | ((q >> 1) & mask);
+  } else {
+    a = (a & mask) | ((q << 1) & ~mask);
+  }
+  return a;
+}
+
+
 static __device__ inline void d_iBIT_4(int& csize, byte in [CS], byte out [CS], byte temp [CS])
 {
   const int SWS = 32;  // sub-warp size
@@ -108,39 +143,7 @@ static __device__ inline void d_iBIT_4(int& csize, byte in [CS], byte out [CS], 
   assert(WS % SWS == 0);
 
   for (int i = tid; i < size; i += TPB) {
-    unsigned int a = in_w[i / 32 + sublane * (size / 32)];
-
-    unsigned int q = pfpl_shfl_xor(a, 16);
-    a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
-
-    q = pfpl_shfl_xor(a, 8);
-    a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
-
-    q = pfpl_shfl_xor(a, 4);
-    unsigned int mask = 0x0F0F0F0F;
-    if ((sublane & 4) == 0) {
-      a = (a & ~mask) | ((q >> 4) & mask);
-    } else {
-      a = (a & mask) | ((q << 4) & ~mask);
-    }
-
-    q = pfpl_shfl_xor(a, 2);
-    mask = 0x33333333;
-    if ((sublane & 2) == 0) {
-      a = (a & ~mask) | ((q >> 2) & mask);
-    } else {
-      a = (a & mask) | ((q << 2) & ~mask);
-    }
-
-    q = pfpl_shfl_xor(a, 1);
-    mask = 0x55555555;
-    if ((sublane & 1) == 0) {
-      a = (a & ~mask) | ((q >> 1) & mask);
-    } else {
-      a = (a & mask) | ((q << 1) & ~mask);
-    }
-
-    out_w[i] = a;
+    out_w[i] = d_iBIT_4_word(in_w[i / 32 + sublane * (size / 32)], sublane);
   }
 
   // copy leftover bytes

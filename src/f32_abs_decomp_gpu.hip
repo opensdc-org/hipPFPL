@@ -93,26 +93,53 @@ static __device__ inline void copy_raw_chunk(const byte* source, byte* destinati
 }
 
 
-static __device__ inline void restore_diff_quant(byte* destination, int bytes,
-                                                   int* scratch, float eb2)
+static __device__ inline void inverse_bit_full_chunk(byte* expanded)
+{
+  constexpr int width = 32;
+  constexpr int words = CS / sizeof(unsigned int);
+  constexpr int words_per_thread = words / TPB;
+  static_assert(words % TPB == 0 && TPB % width == 0);
+
+  auto* storage = reinterpret_cast<unsigned int*>(expanded);
+  const int tid = threadIdx.x;
+  const int lane = tid % width;
+  unsigned int transposed[words_per_thread];
+  #pragma unroll
+  for (int row = 0; row < words_per_thread; ++row) {
+    const int word = tid + row * TPB;
+    const int source = word / width + lane * (words / width);
+    transposed[row] = d_iBIT_4_word(storage[source], lane);
+  }
+
+  __syncthreads();  // All lanes have read the old bit planes.
+  #pragma unroll
+  for (int row = 0; row < words_per_thread; ++row) {
+    storage[tid + row * TPB] = transposed[row];
+  }
+}
+
+
+static __device__ __forceinline__ void restore_diff_quant(const byte* differences,
+    byte* destination, int bytes, int* scratch, float eb2)
 {
   constexpr int words_per_thread = CS / sizeof(float) / TPB;
   static_assert(CS % (sizeof(float) * TPB) == 0);
   constexpr unsigned int diff_bias = 0xAAAAAAAAu;
   constexpr unsigned int max_quantized_code = 1u << 23;
-  auto* words = reinterpret_cast<unsigned int*>(destination);
+  const auto* diff_words = reinterpret_cast<const unsigned int*>(differences);
+  auto* output_words = reinterpret_cast<unsigned int*>(destination);
   const int word_count = bytes / sizeof(float);
   const int tid = threadIdx.x;
   const int begin = tid * word_count / TPB;
   const int count = (tid + 1) * word_count / TPB - begin;
 
-  // Each thread owns a contiguous range. Retain its differences across the
-  // block scan so that expanded quantized words can be restored in place.
+  // Each thread owns a contiguous range and retains its differences across
+  // the block scan. Input and output can alias for a partial final chunk.
   unsigned int diffs[words_per_thread];
   unsigned int sum = 0;
   #pragma unroll
   for (int i = 0; i < words_per_thread; ++i) {
-    const unsigned int diff = (i < count) ? (words[begin + i] ^ diff_bias) - diff_bias : 0u;
+    const unsigned int diff = (i < count) ? (diff_words[begin + i] ^ diff_bias) - diff_bias : 0u;
     diffs[i] = diff;
     sum += diff;
   }
@@ -126,7 +153,7 @@ static __device__ inline void restore_diff_quant(byte* destination, int bytes,
         const int bin = static_cast<int>(bits >> 1) ^ -static_cast<int>(bits & 1u);
         bits = __float_as_uint(bin * eb2);
       }
-      words[begin + i] = bits;
+      output_words[begin + i] = bits;
       sum -= diffs[i];
     }
   }
@@ -182,9 +209,15 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
     if (stored < raw_size) {
       d_iRZE_1(stored, source, expanded_bytes, scratch_bytes);
       __syncthreads();
-      d_iBIT_4(stored, expanded_bytes, destination, scratch_bytes);
-      __syncthreads();  // Publish inverse-bit words to the threads owning their contiguous ranges.
-      restore_diff_quant(destination, stored, scratch, eb2);
+      if (stored == CS) {
+        inverse_bit_full_chunk(expanded_bytes);
+        __syncthreads();  // Publish inverse-bit words in shared memory.
+        restore_diff_quant(expanded_bytes, destination, CS, scratch, eb2);
+      } else {
+        d_iBIT_4(stored, expanded_bytes, destination, scratch_bytes);
+        __syncthreads();  // Publish the temporary words in the output range.
+        restore_diff_quant(destination, destination, stored, scratch, eb2);
+      }
     } else {
       copy_raw_chunk(source, destination, raw_size);
     }
