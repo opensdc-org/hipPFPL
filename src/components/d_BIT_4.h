@@ -37,6 +37,42 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 */
 
 
+static __device__ inline unsigned int d_BIT_4_word(unsigned int a, const int sublane)
+{
+  unsigned int q = pfpl_shfl_xor(a, 16);
+  a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
+
+  q = pfpl_shfl_xor(a, 8);
+  a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
+
+  q = pfpl_shfl_xor(a, 4);
+  unsigned int mask = 0x0F0F0F0F;
+  if ((sublane & 4) == 0) {
+    a = (a & ~mask) | ((q >> 4) & mask);
+  } else {
+    a = ((q << 4) & ~mask) | (a & mask);
+  }
+
+  q = pfpl_shfl_xor(a, 2);
+  mask = 0x33333333;
+  if ((sublane & 2) == 0) {
+    a = (a & ~mask) | ((q >> 2) & mask);
+  } else {
+    a = ((q << 2) & ~mask) | (a & mask);
+  }
+
+  q = pfpl_shfl_xor(a, 1);
+  mask = 0x55555555;
+  if ((sublane & 1) == 0) {
+    a = (a & ~mask) | ((q >> 1) & mask);
+  } else {
+    a = ((q << 1) & ~mask) | (a & mask);
+  }
+
+  return a;
+}
+
+
 static __device__ inline bool d_BIT_4(int& csize, byte in [CS], byte out [CS], byte temp [CS])
 {
   const int SWS = 32;  // sub-warp size
@@ -51,39 +87,7 @@ static __device__ inline bool d_BIT_4(int& csize, byte in [CS], byte out [CS], b
   // works for warpsize of 64 on AMD because shfl does not include sync
 
   for (int i = tid; i < size; i += TPB) {
-    unsigned int a = in_w[i];
-
-    unsigned int q = pfpl_shfl_xor(a, 16);
-    a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
-
-    q = pfpl_shfl_xor(a, 8);
-    a = ((sublane & 8) == 0) ? __byte_perm(a, q, (3 << 12) | (7 << 8) | (1 << 4) | 5) : __byte_perm(a, q, (6 << 12) | (2 << 8) | (4 << 4) | 0);
-
-    q = pfpl_shfl_xor(a, 4);
-    unsigned int mask = 0x0F0F0F0F;
-    if ((sublane & 4) == 0) {
-      a = (a & ~mask) | ((q >> 4) & mask);
-    } else {
-      a = ((q << 4) & ~mask) | (a & mask);
-    }
-
-    q = pfpl_shfl_xor(a, 2);
-    mask = 0x33333333;
-    if ((sublane & 2) == 0) {
-      a = (a & ~mask) | ((q >> 2) & mask);
-    } else {
-      a = ((q << 2) & ~mask) | (a & mask);
-    }
-
-    q = pfpl_shfl_xor(a, 1);
-    mask = 0x55555555;
-    if ((sublane & 1) == 0) {
-      a = (a & ~mask) | ((q >> 1) & mask);
-    } else {
-      a = ((q << 1) & ~mask) | (a & mask);
-    }
-
-    out_w[i / 32 + sublane * (size / 32)] = a;
+    out_w[i / 32 + sublane * (size / 32)] = d_BIT_4_word(in_w[i], sublane);
   }
 
   // copy leftover bytes

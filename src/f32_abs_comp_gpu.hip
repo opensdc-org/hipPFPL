@@ -193,6 +193,26 @@ static __device__ inline void d_QABS_4(int& csize, byte in [CS], byte out [CS], 
 }
 
 
+static __device__ inline void d_DIFFNB_BIT_4_full_chunk(const byte in [CS], byte out [CS])
+{
+  constexpr int width = 32;
+  constexpr int words = CS / sizeof(unsigned int);
+  constexpr unsigned int mask = 0xAAAAAAAAu;
+  static_assert(words % width == 0 && TPB % width == 0);
+
+  const auto* const input_words = reinterpret_cast<const unsigned int*>(in);
+  auto* const output_words = reinterpret_cast<unsigned int*>(out);
+  const int tid = threadIdx.x;
+  const int lane = tid % width;
+  for (int i = tid; i < words; i += TPB) {
+    const unsigned int previous = (i == 0) ? 0u : input_words[i - 1];
+    const unsigned int delta = input_words[i] - previous;
+    const unsigned int differenced = (delta + mask) ^ mask;
+    output_words[i / width + lane * (words / width)] = d_BIT_4_word(differenced, lane);
+  }
+}
+
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
 static __global__ __launch_bounds__(TPB, 3)
 #else
@@ -246,13 +266,15 @@ void d_encode(const byte* const __restrict__ input, const int insize, byte* cons
       d_QABS_4(csize, in, out, errorbound, threshold);
       __syncthreads();
     }
-    if (good) {
+    if (good && osize == CS) {
+      byte* tmp = in; in = out; out = tmp;
+      d_DIFFNB_BIT_4_full_chunk(in, out);
+      __syncthreads();
+    } else if (good) {
       byte* tmp = in; in = out; out = tmp;
       d_DIFFNB_4(csize, in, out, temp);
       __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
+      tmp = in; in = out; out = tmp;
       d_BIT_4(csize, in, out, temp);
       __syncthreads();
     }
