@@ -164,9 +164,9 @@ def prepare(args, report):
                 require(decoded["ok"] and decoded["status"] == "passed", "Unsuccessful S1 decode")
                 data = Path(decoded["output"]["path"]).read_bytes()
                 require(data == decoded_reference, "S1 decoded bytes disagree")
-                numeric = reference.check_numerics(original, data, dtype, mode,
-                                                   layout["stored_error_bound"], threshold(case))
-                require(numeric["ok"], "S1 reconstruction fails its numerical contract")
+        case["reference_numeric_check"] = reference.check_numerics(
+            original, decoded_reference, dtype, mode, header["value"], threshold(case))
+        require(case["reference_numeric_check"]["ok"], "S1 reconstruction fails its numerical contract")
     report["verified_reference_files"] = list(verified.values())
     return {case["id"]: case for case in chosen}
 
@@ -282,11 +282,11 @@ def run_case(case, old, args, report):
                 stream_compare(case, "hip_independent_repeat", streams["hip"], data, (layouts["hip"], layout))
         for label in PATHS:
             encoder, decoder = label.split("_to_")
-            if len(streams[encoder]) > len(original):
+            if len(streams[encoder]) > len(original) and (decoder != "hip" or dtype != "f32"):
                 case["decodings"][label] = {"status": "blocked_by_upstream", "issue": "U004",
                                              "encoded_size_bytes": len(streams[encoder]), "original_size_bytes": len(original)}
                 case["issues"].append({"id": "U004", "status": "blocked_by_upstream", "comparison": label,
-                                       "detail": "Original CPU and GPU decoder host-input allocations are smaller than the encoded stream."})
+                                       "detail": "An oversized stream exceeds the compressed-input capacity of the CPU reference and legacy FP64 decoders."})
                 continue
             binary = (report["hip_binaries"][key + "_decomp"] if decoder == "hip"
                       else report["cpu_binaries"][decoder][key + "_decomp"])
@@ -296,8 +296,13 @@ def run_case(case, old, args, report):
             invocation["output"] = reference.file_record(path)
             reconstructed = path.read_bytes()
             invocation["reference_comparison"] = reference.compare_bytes(target, reconstructed)
-            invocation["numeric_check"] = reference.check_numerics(original, reconstructed, dtype, mode,
-                                                                   layouts[encoder]["stored_error_bound"], threshold(case))
+            layout = layouts[encoder]
+            if (invocation["reference_comparison"]["equal"] and
+                    layout["stored_error_bound_hex"] == case["expected_header_parameter"]["hex"]):
+                invocation["numeric_check"] = {**case["reference_numeric_check"], "reused_from": "serial_to_serial"}
+            else:
+                invocation["numeric_check"] = reference.check_numerics(
+                    original, reconstructed, dtype, mode, layout["stored_error_bound"], threshold(case))
             invocation["status"] = "passed" if invocation["reference_comparison"]["equal"] and invocation["numeric_check"]["ok"] else "failed"
             require(invocation["status"] == "passed", label + " differs from S1 bytes or fails the numerical contract")
         case["five_way_reconstruction_bitwise_equal"] = (len(case["decodings"]) == 5 and

@@ -41,46 +41,18 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 #define GPU_RZE
 
 
+#include <type_traits>
 #include "d_zero_elimination.h"
 #include "d_repetition_elimination.h"
 
 
-// One thread owns four consecutive bytes of the full first-level bitmap.
-// Compare the bytes with their predecessors and pack the resulting nibble.
-static __device__ inline bool encode_rze_bitmap_2048(const byte* in, byte* output,
-                                                     int& capacity, byte* mask, int* scratch)
-{
-  if constexpr (TPB != 512 || WS != 32) {
-    return false;
-  } else {
-    const int tid = threadIdx.x;
-    const int start = tid * sizeof(unsigned int);
-    const unsigned int word = reinterpret_cast<const unsigned int*>(in)[tid];
-    const unsigned int previous = (tid == 0) ? 0 : in[start - 1];
-    const unsigned int changed = d_nonzero_byte_mask(word ^ ((word << 8) | previous));
-    const int count = __popc(changed);
-    const int inclusive = block_prefix_sum(count, scratch);
-    if (tid == TPB - 1) scratch[WS] = inclusive;
-    __syncthreads();
-    const int length = scratch[WS];
-    if (length > capacity) return false;
-
-    const unsigned int other = pfpl_shfl_xor_sync(~0, changed, 1, WS);
-    if ((tid & 1) == 0) mask[tid / 2] = changed | (other << 4);
-    int position = inclusive - count;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      if ((changed >> i) & 1u) output[position++] = word >> (8 * i);
-    }
-    capacity = length;
-    return true;
-  }
-}
-
+#if defined(PFPL_F32_ABS_RZE_ENCODE)
+#include "d_RZE_abs_encode.h"
+#endif
 
 // Finish the common RZE stream after zero elimination has populated the payload
 // and the first bitmap. wpos is measured in bytes.
-template <typename T, bool PackedFirstBitmap = false>
+template <typename T>
 static __device__ inline bool d_RZE_finish(int& csize, const byte in [CS],
                                          byte out [CS], byte temp [CS], int wpos)
 {
@@ -95,21 +67,31 @@ static __device__ inline bool d_RZE_finish(int& csize, const byte in [CS],
   // check if not all zeros
   if (wpos != 0) {
     // iteratively compress bitmaps
+#if defined(PFPL_F32_ABS_RZE_ENCODE)
+    // Preserve the staged FP32 path's scope for the first-level byte count.
+    {
+      constexpr int first_range = 2048 / sizeof(T);
+      int cnt = avail - wpos;
+      if (!d_REencode<byte, first_range, true>(bitmap, first_range, out + wpos, cnt, bitmap + first_range, temp_w)) return false;
+      wpos += cnt;
+      __syncthreads();
+    }
+
+    int base = 2048 / sizeof(T);
+    int range = 256 / sizeof(T);
+    int cnt = avail - wpos;
+#else
     int base = 0 / sizeof(T);
     int range = 2048 / sizeof(T);
     int cnt = avail - wpos;
-    if constexpr (PackedFirstBitmap) {
-      static_assert(sizeof(T) == 1 && TPB == 512 && WS == 32);
-      if (!encode_rze_bitmap_2048(bitmap, out + wpos, cnt, bitmap + range, temp_w)) return false;
-    } else {
-      if (!d_REencode<byte, 2048 / sizeof(T), true>(&bitmap[base], range, &out[wpos], cnt, &bitmap[base + range], temp_w)) return false;
-    }
+    if (!d_REencode<byte, 2048 / sizeof(T), true>(&bitmap[base], range, &out[wpos], cnt, &bitmap[base + range], temp_w)) return false;
     wpos += cnt;
     __syncthreads();
 
     base = 2048 / sizeof(T);
     range = 256 / sizeof(T);
     cnt = avail - wpos;
+#endif
     if (!d_REencode<byte, 256 / sizeof(T), true>(&bitmap[base], range, &out[wpos], cnt, &bitmap[base + range], temp_w)) return false;
     wpos += cnt;
     __syncthreads();
@@ -148,7 +130,6 @@ static __device__ inline bool d_RZE_finish(int& csize, const byte in [CS],
   return true;
 }
 
-
 template <typename T, bool InPlace = false>
 static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byte temp [CS])
 {
@@ -181,61 +162,11 @@ static __device__ inline bool d_RZE(int& csize, byte in [CS], byte out [CS], byt
 }
 
 
-// Restore the first two byte-RZE bitmap levels from a warp-local snapshot.
-// Scratch scan words contain the exclusive offsets of the 32 local masks;
-// the obsolete top level holds the common cursor for their payload.
-static __device__ inline int d_iRZE_upper_byte(int cursor, const byte* in, byte* bitmap, int* temp_w)
-{
-  constexpr int width = 32;
-  constexpr int layer256_offset = 2048;
-  constexpr int layer32_offset = layer256_offset + 256;
-  constexpr int top_offset = layer32_offset + 32;
-  auto* const layer256_start = reinterpret_cast<int*>(bitmap + top_offset);
-  const int tid = threadIdx.x;
+#if defined(PFPL_F32_ABS_RZE_DECODE)
+#include "d_RZE_abs_decode.h"
+#else
 
-  if (tid < width) {
-    unsigned int top_bits = 0;
-    if (tid == 0) {
-      // The last four encoded bytes need not be naturally aligned.
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        top_bits |= static_cast<unsigned int>(in[cursor - 4 + i]) << (8 * i);
-      }
-    }
-    top_bits = pfpl_shfl_sync(~0u, top_bits, 0, width);
-    const int layer32_start = cursor - 4 - __popc(top_bits);
-    const int through = __popc(top_bits & ((1u << tid) - 1u)) +
-                        static_cast<int>((top_bits >> tid) & 1u);
-    const unsigned int mask = (through == 0) ? 0 : in[layer32_start + through - 1];
-    bitmap[layer32_offset + tid] = static_cast<byte>(mask);
-
-    const int changes = __popc(mask);
-    int inclusive = changes;
-    #pragma unroll
-    for (int distance = 1; distance < width; distance <<= 1) {
-      const int prior = pfpl_shfl_up_sync(~0u, inclusive, distance, width);
-      if (tid >= distance) inclusive += prior;
-    }
-    temp_w[tid] = inclusive - changes;
-    if (tid == width - 1) *layer256_start = layer32_start - inclusive;
-  }
-  __syncthreads();  // Publish the 32 masks, offsets and common cursor.
-
-  const int start = *layer256_start;
-  if (tid < 256) {
-    const int byte_index = tid / 8;
-    const int bit = tid % 8;
-    const unsigned int mask = bitmap[layer32_offset + byte_index];
-    const int through = temp_w[byte_index] + __popc(mask & ((1u << bit) - 1u)) +
-                        static_cast<int>((mask >> bit) & 1u);
-    bitmap[layer256_offset + tid] = (through == 0) ? 0 : in[start + through - 1];
-  }
-  __syncthreads();  // Publish the reconstructed 256-byte level to the wide decode.
-  return start;
-}
-
-
-template <typename T, bool WarpUpper = false>
+template <typename T>
 static __device__ inline void d_iRZE(int& csize, const byte in [CS], byte out [CS], byte temp [CS])
 {
   const int tid = threadIdx.x;
@@ -265,38 +196,31 @@ static __device__ inline void d_iRZE(int& csize, const byte in [CS], byte out [C
 
     // iteratively decompress bitmaps
     int base, range;
-    if constexpr (WarpUpper) {
-      static_assert(std::is_same<T, byte>::value && WS == 32);
-      rpos = d_iRZE_upper_byte(rpos, in, bitmap, temp_w);
-      base = 2048;
-      range = 256;
+    if constexpr (sizeof(T) == 8) {
+      base = (2048 + 256) / sizeof(T);
+      range = 32 / sizeof(T);
+      // read in last level of bitmap
+      rpos -= range;
+      if (tid < range) bitmap[base + tid] = in[rpos + tid];
     } else {
-      if constexpr (sizeof(T) == 8) {
-        base = (2048 + 256) / sizeof(T);
-        range = 32 / sizeof(T);
-        // read in last level of bitmap
-        rpos -= range;
-        if (tid < range) bitmap[base + tid] = in[rpos + tid];
-      } else {
-        base = (2048 + 256 + 32) / sizeof(T);
-        range = 4 / sizeof(T);
-        // read in last level of bitmap
-        rpos -= range;
-        if (tid < range) bitmap[base + tid] = in[rpos + tid];
+      base = (2048 + 256 + 32) / sizeof(T);
+      range = 4 / sizeof(T);
+      // read in last level of bitmap
+      rpos -= range;
+      if (tid < range) bitmap[base + tid] = in[rpos + tid];
 
-        rpos -= __syncthreads_count((tid < range * 8) && ((in[rpos + tid / 8] >> (tid % 8)) & 1));
-        base = (2048 + 256) / sizeof(T);
-        range = 32 / sizeof(T);
-        d_REdecode<byte, 32 / sizeof(T)>(range, &in[rpos], &bitmap[base + range], &bitmap[base], temp_w);
-      }
-      __syncthreads();
-
-      rpos -= __syncthreads_count((tid < range * 8) && ((bitmap[base + tid / 8] >> (tid % 8)) & 1));
-      base = 2048 / sizeof(T);
-      range = 256 / sizeof(T);
-      d_REdecode<byte, 256 / sizeof(T)>(range, &in[rpos], &bitmap[base + range], &bitmap[base], temp_w);
-      __syncthreads();
+      rpos -= __syncthreads_count((tid < range * 8) && ((in[rpos + tid / 8] >> (tid % 8)) & 1));
+      base = (2048 + 256) / sizeof(T);
+      range = 32 / sizeof(T);
+      d_REdecode<byte, 32 / sizeof(T)>(range, &in[rpos], &bitmap[base + range], &bitmap[base], temp_w);
     }
+    __syncthreads();
+
+    rpos -= __syncthreads_count((tid < range * 8) && ((bitmap[base + tid / 8] >> (tid % 8)) & 1));
+    base = 2048 / sizeof(T);
+    range = 256 / sizeof(T);
+    d_REdecode<byte, 256 / sizeof(T)>(range, &in[rpos], &bitmap[base + range], &bitmap[base], temp_w);
+    __syncthreads();
 
     if constexpr (sizeof(T) >= 4) {
       rpos -= __syncthreads_count((tid < range * 8) && ((bitmap[base + tid / 8] >> (tid % 8)) & 1));
@@ -319,16 +243,12 @@ static __device__ inline void d_iRZE(int& csize, const byte in [CS], byte out [C
     __syncthreads();
 
     // copy non-zero values based on bitmap
-    if constexpr (WarpUpper) {
-      static_assert(std::is_same<T, byte>::value && CS == 16384 && TPB == 512);
-      if (size == CS) {
-        d_ZEdecode_full_byte_permute(in, rpos, bitmap, out, temp_w);
-        return;
-      }
-    }
     if (size > 0) d_ZEdecode(size, (const T*)in, (T*)bitmap, (T*)out, temp_w);
   }
 }
+
+#endif
+
 
 
 #endif

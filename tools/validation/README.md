@@ -1,6 +1,6 @@
 # Tests
 
-Use Linux with Python 3.9 or later. See [`make check`](../../README.md#tests) for the routine checks and reference fetch. The commands below run individual checks from the repository root. Use fresh output directories.
+Use Linux with Python 3.9 or later. See [`make check`](../../README.md#tests) for the smoke suite and reference fetch. The commands below run additional checks from the repository root. Use fresh output directories.
 
 ## Build and check the upstream CPU reference
 
@@ -42,7 +42,7 @@ Each check reports its status and verifies the selected device.
 
 ## Extended file comparisons
 
-Build the CPU reference and run its checks above. Then build the HIP programs and generate their manifest:
+Build the CPU reference for the cross-platform comparisons. Run its checks above before using `hip_equivalence_suite.py`. Then build the HIP programs and generate their manifest:
 
 ```sh
 python3 -B tools/validation/build_hip_manifest.py --output artifacts/hip-build
@@ -59,7 +59,21 @@ python3 -B tools/validation/hip_equivalence_suite.py "${hip_args[@]}" \
   --reference-results artifacts/cpu-suite/results.json \
   --dtype f32 --mode abs --output artifacts/hip-equivalence
 python3 -B tools/validation/extended_equivalence_suite.py "${hip_args[@]}" "${cpu_args[@]}" \
-  --profile mixed --output artifacts/hip-mixed
+  --profile all --output artifacts/hip-extended
 ```
 
 The comparisons check defined header fields, chunk lengths, payload and reconstructed values. FP32 header bytes 12–15 are unassigned by PFPL and reported separately. For a CUDA reference build, use the [upstream instructions](https://github.com/burtscher/PFPL/blob/36f5aaef42744ed78b4d1525b03a7fb2168b363c/README.md#installation).
+
+The reference comparisons skip oversized packets for legacy CPU and FP64 decoders. The `oversized` profile checks the FP32 HIP decoders in all three modes with a full raw chunk and a raw tail. The `all` profile includes `mixed`, `large`, and `oversized`.
+
+## Quantum state-vector regression
+
+Provide the QAOA and GHZ + inverse QFT samples as raw little-endian interleaved FP32 real and imaginary values. The profile supplies the error parameters used for the [BW150 measurements](../../README.md#fp32-results-on-bw150). The samples are supplied locally, and this profile runs on demand.
+
+```bash
+python3 -B tools/validation/extended_equivalence_suite.py "${hip_args[@]}" \
+  --profile quantum --qaoa /path/to/qaoa.f32 --ghz-iqft /path/to/ghz-inverse-qft.f32 \
+  --output artifacts/hip-quantum
+```
+
+The six cases check packet structure and reconstruction error for ABS, NOA, and REL. The report records the input hashes so results can be matched to the samples used.

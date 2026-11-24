@@ -111,6 +111,8 @@ static __device__ inline bool d_BIT_4(int& csize, byte in [CS], byte out [CS], b
 
 static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
 {
+#if defined(PFPL_F32_ABS_RZE_DECODE)
+  // Preserve the measured ABS decoder's GPU instruction sequence.
   unsigned int q = bit_shuffle_xor<16>(a);
   a = ((sublane & 16) == 0) ? __byte_perm(a, q, (3 << 12) | (2 << 8) | (7 << 4) | 6) : __byte_perm(a, q, (5 << 12) | (4 << 8) | (1 << 4) | 0);
 
@@ -141,6 +143,9 @@ static __device__ inline unsigned int d_iBIT_4_word(unsigned int a, int sublane)
     a = (a & mask) | ((q << 1) & ~mask);
   }
   return a;
+#else
+  return d_BIT_4_word(a, sublane);
+#endif
 }
 
 

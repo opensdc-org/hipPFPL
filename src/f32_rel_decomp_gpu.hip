@@ -45,19 +45,8 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #define WS 32
 
 
-#include <cmath>
-#include <string>
-#include <cassert>
-#include <stdexcept>
-#include <hip/hip_runtime.h>
-#include "include/macros.h"
-#include "include/sum_reduction.h"
-#include "include/max_scan.h"
-#include "include/prefix_sum.h"
-#include "components/d_DIFFNB_4.h"
-#include "components/d_BIT_4.h"
-#include "components/d_RZE_1.h"
-#include <sys/time.h>
+#include "include/f32_decode_gpu.h"
+#include "include/f32_file_io.h"
 
 
 const int NUM_RUNS = 9;
@@ -90,189 +79,27 @@ static __device__ inline float d_REL_pow2approxf(const float log_f)
 }
 
 
-// copy (len) bytes from global memory (source) to shared memory (destination) using separate shared memory buffer (temp)
-// destination and temp must we word aligned, accesses up to CS + 3 bytes in temp
-static inline __device__ void g2s(void* const __restrict__ destination, const void* const __restrict__ source, const int len, void* const __restrict__ temp)
+struct RelRestoreWord
 {
-  const int tid = threadIdx.x;
-  const byte* const __restrict__ input = (byte*)source;
-  if (len < 128) {
-    byte* const __restrict__ output = (byte*)destination;
-    if (tid < len) output[tid] = input[tid];
-  } else {
-    const int nonaligned = (int)(size_t)input;
-    const int wordaligned = (nonaligned + 3) & ~3;
-    const int linealigned = (nonaligned + 127) & ~127;
-    const int bcnt = wordaligned - nonaligned;
-    const int wcnt = (linealigned - wordaligned) / 4;
-    int* const __restrict__ out_w = (int*)destination;
-    if (bcnt == 0) {
-      const int* const __restrict__ in_w = (int*)input;
-      byte* const __restrict__ out = (byte*)destination;
-      if (tid < wcnt) out_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < len / 4; i += TPB) {
-        out_w[i] = in_w[i];
-      }
-      if (tid < (len & 3)) {
-        const int i = len - 1 - tid;
-        out[i] = input[i];
-      }
-    } else {
-      const int offs = 4 - bcnt;  //(4 - bcnt) & 3;
-      const int shift = offs * 8;
-      const int rlen = len - bcnt;
-      const int* const __restrict__ in_w = (int*)&input[bcnt];
-      byte* const __restrict__ buffer = (byte*)temp;
-      byte* const __restrict__ buf = (byte*)&buffer[offs];
-      int* __restrict__ buf_w = (int*)&buffer[4];  //(int*)&buffer[(bcnt + 3) & 4];
-      if (tid < bcnt) buf[tid] = input[tid];
-      if (tid < wcnt) buf_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < rlen / 4; i += TPB) {
-        buf_w[i] = in_w[i];
-      }
-      if (tid < (rlen & 3)) {
-        const int i = len - 1 - tid;
-        buf[i] = input[i];
-      }
-      __syncthreads();
-      buf_w = (int*)buffer;
-      for (int i = tid; i < (len + 3) / 4; i += TPB) {
-        out_w[i] = __funnelshift_r(buf_w[i], buf_w[i + 1], shift);
-      }
-    }
+  __device__ explicit RelRestoreWord(float errorbound)
+      : log2eb(2 * d_REL_log2approxf(1 + errorbound)) {}
+
+  __device__ unsigned int operator()(unsigned int bits) const
+  {
+    constexpr unsigned int signexpomask = 0xff800000u;
+    const unsigned int val = (bits + 1u) ^ signexpomask;
+    const unsigned int code = val & ~signexpomask;
+    if ((val & signexpomask) != signexpomask || code == 0) return val;
+    if (code == 1) return 0;
+
+    const unsigned int dec = (code >> 1) - 1;
+    const int bin = static_cast<int>(dec >> 1) ^ -static_cast<int>(dec & 1u);
+    const float magnitude = d_REL_pow2approxf(bin * log2eb);
+    return __float_as_uint((val & 1u) ? -magnitude : magnitude);
   }
-}
 
-
-static __device__ int g_chunk_counter;
-
-
-static __global__ void d_reset()
-{
-  g_chunk_counter = 0;
-}
-
-
-static __device__ inline void d_iQREL_4(int& csize, byte in [CS], byte out [CS], const float errorbound)
-{
-  using ftype = float;
-  using itype = int;
-  const int size = csize / sizeof(ftype);
-  const int tid = threadIdx.x;
-
-  const int mantissabits = 23;
-  const itype signexpomask = ~0 << mantissabits;
-
-  const ftype log2eb = 2 * d_REL_log2approxf(1 + errorbound);
-
-  itype* const data_in_i = (itype*)in;
-  itype* const data_out_i = (itype*)out;
-
-  for (int i = tid; i < size; i += TPB) {
-    itype val = (data_in_i[i] + 1) ^ signexpomask;
-    if (((val & signexpomask) == signexpomask) && ((val & ~signexpomask) != 0)) {  // is encoded value
-      if (val == (signexpomask | 1)) {
-        val = 0;
-      } else {
-        const itype dec = ((val & ~signexpomask) >> 1) - 1;
-        const itype bin = (dec >> 1) ^ (((dec << 31) >> 31));  // TCMS decoding
-        const ftype abs_recon_f = d_REL_pow2approxf(bin * log2eb);
-        const ftype output = (val & 1) ? -abs_recon_f : abs_recon_f;
-        val = *((itype*)&output);
-      }
-    }
-    data_out_i[i] = val;
-  }
-}
-
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
-static __global__ __launch_bounds__(TPB, 3)
-#else
-static __global__ __launch_bounds__(TPB, 2)
-#endif
-void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, int* const __restrict__ g_outsize)
-{
-  // allocate shared memory buffer
-  __shared__ long long chunk [3 * (CS / sizeof(long long))];
-  const int last = 3 * (CS / sizeof(long long)) - 2 - WS;
-
-  // input header
-  long long* const head_in = (long long*)input;
-  float* const head_in_f = (float*)&head_in[1];
-  const int outsize = (int)head_in[0];
-  const float errorbound = head_in_f[0];
-
-  // initialize
-  const int chunks = (outsize + CS - 1) / CS;  // round up
-  unsigned short* const size_in = (unsigned short*)&head_in[2];
-  byte* const data_in = (byte*)&size_in[chunks];
-
-  // loop over chunks
-  const int tid = threadIdx.x;
-  int prevChunkID = 0;
-  int prevOffset = 0;
-  do {
-    // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
-    __syncthreads();  // chunk[last] produced, chunk consumed
-
-    // terminate if done
-    const int chunkID = chunk[last];
-    const int base = chunkID * CS;
-    if (base >= outsize) break;
-
-    // compute sum of all prior csizes (start where left off in previous iteration)
-    int sum = 0;
-    for (int i = prevChunkID + tid; i < chunkID; i += TPB) {
-      sum += (int)size_in[i];
-    }
-    int csize = (int)size_in[chunkID];
-    const int offs = prevOffset + block_sum_reduction(sum, (int*)&chunk[last + 1]);
-    prevChunkID = chunkID;
-    prevOffset = offs;
-
-    // create the 3 shared memory buffers
-    byte* in = (byte*)&chunk[0 * (CS / sizeof(long long))];
-    byte* out = (byte*)&chunk[1 * (CS / sizeof(long long))];
-    byte* temp = (byte*)&chunk[2 * (CS / sizeof(long long))];
-
-    // load chunk
-    g2s(in, &data_in[offs], csize, out);
-    byte* tmp = in; in = out; out = tmp;
-    __syncthreads();  // chunk produced, chunk[last] consumed
-
-    // decode
-    const int osize = min(CS, outsize - base);
-    if (csize < osize) {
-      byte* tmp;
-      tmp = in; in = out; out = tmp;
-      d_iRZE_1(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iBIT_4(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iDIFFNB_4(csize, in, out, temp);
-      __syncthreads();
-      tmp = in; in = out; out = tmp;
-      d_iQREL_4(csize, in, out, errorbound);
-      __syncthreads();
-     }
-
-    long long* const output_l = (long long*)&output[base];
-    long long* const out_l = (long long*)out;
-    for (int i = tid; i < osize / 8; i += TPB) {
-      output_l[i] = out_l[i];
-    }
-    const int extra = osize % 8;
-    if (tid < extra) output[base + osize - extra + tid] = out[osize - extra + tid];
-  } while (true);
-
-  if ((blockIdx.x == 0) && (tid == 0)) {
-    *g_outsize = outsize;
-  }
-}
+  float log2eb;
+};
 
 
 struct GPUTimer
@@ -296,7 +123,7 @@ static void CheckHip(const int line)
 }
 
 
-int main(int argc, char* argv [])
+int main(int argc, char* argv []) try
 {
   printf("PFPL GPU Single-Precision REL Decompressor\n");
   printf("Copyright 2025 Texas State University\n\n");
@@ -304,16 +131,8 @@ int main(int argc, char* argv [])
   // read input from file
   if (argc < 3) {printf("USAGE: %s compressed_file_name decompressed_file_name\n\n", argv[0]);  throw std::runtime_error("LC error");}
 
-  // read input file
-  FILE* const fin = fopen(argv[1], "rb");
-  int pre_size = 0;
-  const int pre_val = fread(&pre_size, sizeof(pre_size), 1, fin); assert(pre_val == sizeof(pre_size));
-  fseek(fin, 0, SEEK_END);
-  const int hencsize = ftell(fin);  assert(hencsize > 0);
-  byte* const hencoded = new byte [pre_size];
-  fseek(fin, 0, SEEK_SET);
-  const int insize = fread(hencoded, 1, hencsize, fin);  assert(insize == hencsize);
-  fclose(fin);
+  int pre_size, chunks, insize;
+  auto hencoded = read_f32_packet(argv[1], pre_size, chunks, insize);
   printf("encoded size: %d bytes\n", insize);
 
   // get GPU info
@@ -323,7 +142,7 @@ int main(int argc, char* argv [])
   if ((deviceProp.major == 9999) && (deviceProp.minor == 9999)) {fprintf(stderr, "ERROR: no HIP capable device detected\n\n"); throw std::runtime_error("LC error");}
   const int SMs = deviceProp.multiProcessorCount;
   const int mTpSM = deviceProp.maxThreadsPerMultiProcessor;
-  const int blocks = SMs * (mTpSM / TPB);
+  const int blocks = decode_grid_for_packet(SMs * (mTpSM / TPB), chunks);
   CheckHip(__LINE__);
 
   // allocate GPU memory
@@ -331,11 +150,15 @@ int main(int argc, char* argv [])
   hipHostMalloc((void **)&ddecoded, pre_size);
   byte* d_encoded;
   hipMalloc((void **)&d_encoded, insize);
-  hipMemcpy(d_encoded, hencoded, insize, hipMemcpyHostToDevice);
+  hipMemcpy(d_encoded, hencoded.get(), insize, hipMemcpyHostToDevice);
+  hencoded.reset();
   byte* d_decoded;
   hipMalloc((void **)&d_decoded, pre_size);
   int* d_decsize;
   hipMalloc((void **)&d_decsize, sizeof(int));
+  int* d_offsets;
+  const auto offset_alloc = hipMalloc((void **)&d_offsets, sizeof(int) * chunks);
+  if (offset_alloc != hipSuccess) throw std::runtime_error(hipGetErrorString(offset_alloc));
   CheckHip(__LINE__);
 
   // time GPU decoding
@@ -345,8 +168,8 @@ int main(int argc, char* argv [])
     hipDeviceSynchronize();
     dtimer.start();
 
-    d_reset<<<1, 1>>>();
-    d_decode<<<blocks, TPB>>>(d_encoded, d_decoded, d_decsize);
+    d_chunk_offsets<<<1, TPB>>>(d_encoded, chunks, d_offsets);
+    d_decode<RelRestoreWord><<<blocks, TPB>>>(d_encoded, d_decoded, d_decsize, d_offsets, chunks);
 
     hipDeviceSynchronize();
     double runtime = dtimer.stop();
@@ -360,24 +183,30 @@ int main(int argc, char* argv [])
   }
 
   // get decoded GPU result
-  hipMemcpy(&ddecsize, d_decsize, sizeof(int), hipMemcpyDeviceToHost);
-  hipMemcpy(ddecoded, d_decoded, ddecsize, hipMemcpyDeviceToHost);
+  if (hipMemcpy(&ddecsize, d_decsize, sizeof(int), hipMemcpyDeviceToHost) != hipSuccess || ddecsize != pre_size)
+    throw std::runtime_error("Decoded size does not match encoded header");
+  if (hipMemcpy(ddecoded, d_decoded, ddecsize, hipMemcpyDeviceToHost) != hipSuccess)
+    throw std::runtime_error("Cannot read decoded data");
   printf("decoded size: %d bytes\n", ddecsize);
   printf("compression ratio: %.2f\n", 1.0 * ddecsize / insize);
   CheckHip(__LINE__);
 
   // write to file
-  FILE* const fout = fopen(argv[2], "wb");
-  fwrite(ddecoded, 1, ddecsize, fout);
-  fclose(fout);
+  write_f32_output(argv[2], ddecoded, ddecsize);
 
   // clean up GPU memory
   hipFree(d_encoded);
   hipFree(d_decoded);
   hipFree(d_decsize);
+  hipFree(d_offsets);
   CheckHip(__LINE__);
 
   // clean up
   hipHostFree(ddecoded);
   return 0;
+}
+catch (const std::exception& error)
+{
+  fprintf(stderr, "%s\n", error.what());
+  return 1;
 }

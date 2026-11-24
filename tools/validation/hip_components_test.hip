@@ -23,8 +23,6 @@ static constexpr int TPB = 512;
 #define WS 32
 
 #include "include/macros.h"
-#include "include/sum_reduction.h"
-#include "include/max_scan.h"
 #include "include/prefix_sum.h"
 #include "components/h_DIFFNB_4.h"
 #include "components/h_DIFFNB_8.h"
@@ -356,6 +354,11 @@ std::string run_case(DeviceBuffers& device, Component component, int length,
 }  // namespace
 
 int main(int argc, char** argv) {
+  constexpr int lengths[] = {1, 7, 8, 31, 32, 33, 127, 128, 129, 511, 512, 513,
+                             4095, 4096, 4097, CS - 1, CS};
+  constexpr int pattern_count = 3;
+  constexpr auto expected_cases = (RZE1 - DIFF4 + 1) *
+      (sizeof(lengths) / sizeof(lengths[0]) * pattern_count - 1);
   DeviceBuffers device;
   std::vector<std::string> cases, errors;
   std::string expected_pci, actual_pci;
@@ -388,11 +391,11 @@ int main(int argc, char** argv) {
     checked(hipMalloc(reinterpret_cast<void**>(&device.output), kStride), "hipMalloc output");
     checked(hipMalloc(reinterpret_cast<void**>(&device.result), sizeof(DeviceResult)), "hipMalloc result");
 
-    const int lengths[] = {1, 7, 8, 31, 32, 33, 127, 128, 129, 511, 512, 513,
-                           4095, 4096, 4097, CS - 1, CS};
     for (int component = DIFF4; component <= RZE1; ++component) {
       for (int length : lengths) {
-        for (int pattern = 0; pattern < 3; ++pattern) {
+        for (int pattern = 0; pattern < pattern_count; ++pattern) {
+          // A one-byte periodic input is already covered by the zero pattern.
+          if (length == 1 && pattern == 1) continue;
           bool passed = false;
           cases.push_back(run_case(device, static_cast<Component>(component), length,
                                    pattern, passed, decode_count));
@@ -409,7 +412,7 @@ int main(int argc, char** argv) {
   if (device.output) cleanup_checked(hipFree(device.output), "hipFree output", errors);
   if (device.input) cleanup_checked(hipFree(device.input), "hipFree input", errors);
 
-  const bool passed = errors.empty() && failed_cases == 0 && cases.size() == 5 * 17 * 3;
+  const bool passed = errors.empty() && failed_cases == 0 && cases.size() == expected_cases;
   std::cout << std::boolalpha << "{\"status\":" << quoted(passed ? "passed" : "failed")
             << ",\"case_count\":" << cases.size()
             << ",\"failures\":" << failed_cases + errors.size()

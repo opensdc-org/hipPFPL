@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -276,6 +277,8 @@ int main(int argc, char** argv) {
         if (selected_blocks && blocks != selected_blocks) continue;
         for (const char* pattern : kPatterns) {
           if (!selected_pattern.empty() && selected_pattern != pattern) continue;
+          // Both patterns contain only 1 for a single chunk.
+          if (selected_pattern.empty() && chunks == 1 && std::strcmp(pattern, "alternating") == 0) continue;
           for (int repeat = 0; repeat < repeats; ++repeat) {
             cases.push_back({chunks, blocks, pattern, repeat});
           }
@@ -345,10 +348,10 @@ int main(int argc, char** argv) {
               << ", \"warp_size\": " << properties.warpSize
               << ", \"multiprocessors\": " << properties.multiProcessorCount << '}';
   } else std::cout << "null";
-  std::cout << ",\n  \"production_function\": \"src/f32_abs_comp_gpu.hip::propagate_carry\""
+  std::cout << ",\n  \"production_function\": \"src/include/f32_encode_common.h::propagate_carry\""
             << ",\n  \"threads_per_block\": " << TPB
             << ",\n  \"shared_bytes_per_block\": " << kSharedBytes
-            << ",\n  \"device_buffer_bytes\": " << 4 * (kMaxChunks + 2) * sizeof(int)
+            << ",\n  \"device_buffer_bytes\": " << (4 * (kMaxChunks + 2) + 1) * sizeof(int)
             << ",\n  \"cases\": [";
   for (size_t index = 0; index < results.size(); ++index) {
     if (index) std::cout << ',';

@@ -5,7 +5,13 @@
 // Scan u16 packet lengths into byte offsets. Lengths and offsets start on
 // four-entry boundaries; a partial group uses scalar loads and stores.
 // The input packet limit guarantees that all offsets fit in an int.
+#if defined(PFPL_ABS_WAVE_OFFSETS)
+static __device__ inline unsigned int restore_wave_inclusive(unsigned int count, int* scratch);
+
+template <bool return_total, bool WavePrefix = false>
+#else
 template <bool return_total>
+#endif
 static __device__ __forceinline__ int scan_chunk_offsets(const unsigned short* lengths, int count,
     int* offsets, int payload_bytes, unsigned int* scan_scratch, unsigned int& tile_total)
 {
@@ -14,8 +20,15 @@ static __device__ __forceinline__ int scan_chunk_offsets(const unsigned short* l
   const auto* length_groups = reinterpret_cast<const unsigned long long*>(lengths);
   auto* offset_groups = reinterpret_cast<int4*>(offsets);
   const int tid = threadIdx.x;
-  if (tid < WS) scan_scratch[tid] = 0;
-  __syncthreads();
+#if defined(PFPL_ABS_WAVE_OFFSETS)
+  static_assert(!WavePrefix || !return_total);
+  if constexpr (!WavePrefix) {
+#endif
+    if (tid < WS) scan_scratch[tid] = 0;
+    __syncthreads();
+#if defined(PFPL_ABS_WAVE_OFFSETS)
+  }
+#endif
   for (int tile = 0; tile < count; tile += tile_size) {
     const int local = tile + tid * lengths_per_thread;
     const int remaining = count - local;
@@ -39,7 +52,13 @@ static __device__ __forceinline__ int scan_chunk_offsets(const unsigned short* l
     const unsigned int before2 = s0 + s1;
     const unsigned int before3 = before2 + s2;
     const unsigned int tile_group_length = before3 + s3;
+#if defined(PFPL_ABS_WAVE_OFFSETS)
+    const unsigned int inclusive = WavePrefix
+        ? restore_wave_inclusive(tile_group_length, reinterpret_cast<int*>(scan_scratch))
+        : block_prefix_sum(tile_group_length, scan_scratch);
+#else
     const unsigned int inclusive = block_prefix_sum(tile_group_length, scan_scratch);
+#endif
     const int offset = payload_bytes + static_cast<int>(inclusive - tile_group_length);
 
     if (remaining >= lengths_per_thread) {
@@ -52,6 +71,10 @@ static __device__ __forceinline__ int scan_chunk_offsets(const unsigned short* l
       if (remaining > 2) offsets[local + 2] = offset + static_cast<int>(before2);
     }
 
+#if defined(PFPL_ABS_WAVE_OFFSETS)
+    // The selected path fits one tile and needs only offsets, never its total.
+    if constexpr (WavePrefix) return payload_bytes;
+#endif
     if (return_total || tile + tile_size < count) {
       if (tid == TPB - 1) tile_total = inclusive;
       __syncthreads();

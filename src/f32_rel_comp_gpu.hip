@@ -45,19 +45,15 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #define WS 32
 
 
-#include <string>
-#include <cmath>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <hip/hip_runtime.h>
-#include "include/macros.h"
-#include "include/sum_reduction.h"
-#include "include/max_scan.h"
-#include "include/prefix_sum.h"
-#include "components/d_DIFFNB_4.h"
-#include "components/d_BIT_4.h"
-#include "components/d_RZE_1.h"
-#include <sys/time.h>
+#include "include/f32_staged_encode.h"
+#include "include/f32_file_io.h"
 
 
 const int NUM_RUNS = 9;
@@ -90,256 +86,73 @@ static __device__ inline float d_REL_pow2approxf(const float log_f)
 }
 
 
-// copy (len) bytes from shared memory (source) to global memory (destination)
-// source must we word aligned
-static inline __device__ void s2g(void* const __restrict__ destination, const void* const __restrict__ source, const int len)
+struct RelWordQuantizer
 {
-  const int tid = threadIdx.x;
-  const byte* const __restrict__ input = (byte*)source;
-  byte* const __restrict__ output = (byte*)destination;
-  if (len < 128) {
-    if (tid < len) output[tid] = input[tid];
-  } else {
-    const int nonaligned = (int)(size_t)output;
-    const int wordaligned = (nonaligned + 3) & ~3;
-    const int linealigned = (nonaligned + 127) & ~127;
-    const int bcnt = wordaligned - nonaligned;
-    const int wcnt = (linealigned - wordaligned) / 4;
-    const int* const __restrict__ in_w = (int*)input;
-    if (bcnt == 0) {
-      int* const __restrict__ out_w = (int*)output;
-      if (tid < wcnt) out_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < len / 4; i += TPB) {
-        out_w[i] = in_w[i];
-      }
-      if (tid < (len & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
-    } else {
-      const int shift = bcnt * 8;
-      const int rlen = len - bcnt;
-      int* const __restrict__ out_w = (int*)&output[bcnt];
-      if (tid < bcnt) output[tid] = input[tid];
-      if (tid < wcnt) out_w[tid] = __funnelshift_r(in_w[tid], in_w[tid + 1], shift);
-      for (int i = tid + wcnt; i < rlen / 4; i += TPB) {
-        out_w[i] = __funnelshift_r(in_w[i], in_w[i + 1], shift);
-      }
-      if (tid < (rlen & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
-    }
-  }
-}
+  float errorbound;
+  float threshold;
+  float log2eb;
+  float inv_log2eb;
 
-
-static __device__ int g_chunk_counter;
-
-
-static __global__ void d_reset()
-{
-  g_chunk_counter = 0;
-}
-
-
-static inline __device__ void propagate_carry(const int value, const int chunkID, volatile int* const __restrict__ fullcarry, int* const __restrict__ s_fullc)
-{
-  if (threadIdx.x == TPB - 1) {  // last thread
-    fullcarry[chunkID] = (chunkID == 0) ? value : -value;
-  }
-
-  if (chunkID != 0) {
-    if (threadIdx.x + WS >= TPB) {  // last warp
-      const int lane = threadIdx.x % WS;
-      const int cidm1ml = chunkID - 1 - lane;
-      int val = -1;
-      pfpl_syncwarp();  // not optional
-      do {
-        if (cidm1ml >= 0) {
-          val = fullcarry[cidm1ml];
-        }
-      } while ((pfpl_any_sync(~0, val == 0)) || (pfpl_all_sync(~0, val <= 0)));
-#if defined(WS) && (WS == 64)
-      const long long mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffsll(mask) - 1;
-#else
-      const int mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffs(mask) - 1;
-#endif
-      int partc = (lane < pos) ? -val : 0;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-      partc = __reduce_add_sync(~0, partc);
-#else
-      partc += pfpl_shfl_xor_sync(~0, partc, 1);
-      partc += pfpl_shfl_xor_sync(~0, partc, 2);
-      partc += pfpl_shfl_xor_sync(~0, partc, 4);
-      partc += pfpl_shfl_xor_sync(~0, partc, 8);
-      partc += pfpl_shfl_xor_sync(~0, partc, 16);
-#endif
-      if (lane == pos) {
-        const int fullc = partc + val;
-        fullcarry[chunkID] = fullc + value;
-        *s_fullc = fullc;
-      }
-    }
-  }
-}
-
-
-static __device__ inline void d_QREL_4(int& csize, byte in [CS], byte out [CS], const float errorbound, const float threshold)
-{
-  using ftype = float;
-  using itype = int;
-  const int size = csize / sizeof(ftype);
-  const int tid = threadIdx.x;
-
-  const int mantissabits = 23;
-  const itype signexpomask = ~0 << mantissabits;
-  const itype maxbin = (1 << (mantissabits - 2)) - 1;  // leave 2 bits for 2 signs (plus one element)
-
-  const ftype log2eb = 2 * d_REL_log2approxf(1 + errorbound);
-  const ftype inv_log2eb = 1 / log2eb;
-
-  itype* const data_out_i = (itype*)out;
-  itype* const data_in_i = (itype*)in;
-
-  for (int i = tid; i < size; i += TPB) {
-    const itype orig_i = data_in_i[i];
-    const itype abs_orig_i = orig_i & 0x7fff'ffff;
-    const ftype abs_orig_f = *((ftype*)&abs_orig_i);
-    itype output = orig_i;
+  __device__ __forceinline__ unsigned int operator()(unsigned int orig_i) const
+  {
+    constexpr int mantissabits = 23;
+    constexpr unsigned int signexpomask = 0xff800000u;
+    constexpr int maxbin = (1 << (mantissabits - 2)) - 1;
+    const unsigned int abs_orig_i = orig_i & 0x7fffffffu;
+    const float abs_orig_f = __uint_as_float(abs_orig_i);
+    unsigned int output = orig_i;
     const int expo = (orig_i >> mantissabits) & 0xff;
-    if (expo == 0) {  // zero or de-normal values
-      if (abs_orig_i == 0) {  // zero
+    if (expo == 0) {
+      if (abs_orig_i == 0) {
         output = signexpomask | 1;
       }
+    } else if (expo == 0xff) {
+      if (((orig_i & signexpomask) == signexpomask) && ((orig_i & ~signexpomask) != 0)) {
+        output = abs_orig_i;  // Preserve the established positive-NaN encoding.
+      }
     } else {
-      if (expo == 0xff) {  // INF or NaN
-        if (((orig_i & signexpomask) == signexpomask) && ((orig_i & ~signexpomask) != 0)) {  // negative NaN
-          output = abs_orig_i;  // make positive NaN
-        }
-      } else {  // normal value
-        const ftype log_f = d_REL_log2approxf(abs_orig_f);
-        const ftype scaled = log_f * inv_log2eb;
-        itype bin = (itype)roundf(scaled);
-        const ftype abs_recon_f = d_REL_pow2approxf(bin * log2eb);
-        const ftype lower = abs_orig_f / (1 + errorbound);
-        const ftype upper = abs_orig_f * (1 + errorbound);
-        if (!((bin >= maxbin) || (bin <= -maxbin) || (abs_orig_f >= threshold) || (abs_recon_f < lower) || (abs_recon_f > upper) || (abs_recon_f == 0) || !isfinite(abs_recon_f))) {
-          bin = (bin << 1) ^ (bin >> 31);  // TCMS encoding
-          bin = (bin + 1) << 1;
-          if (orig_i < 0) bin |= 1;  // include sign
-          output = signexpomask | bin;  // 'sign' and 'exponent' fields are all ones, 'mantissa' is non-zero (looks like a negative NaN)
-        }
+      const float log_f = d_REL_log2approxf(abs_orig_f);
+      const float scaled = log_f * inv_log2eb;
+      const int bin = static_cast<int>(roundf(scaled));
+      const float abs_recon_f = d_REL_pow2approxf(bin * log2eb);
+      const float lower = abs_orig_f / (1 + errorbound);
+      const float upper = abs_orig_f * (1 + errorbound);
+      if (!((bin >= maxbin) || (bin <= -maxbin) || (abs_orig_f >= threshold) ||
+            (abs_recon_f < lower) || (abs_recon_f > upper) || (abs_recon_f == 0) || !isfinite(abs_recon_f))) {
+        const unsigned int sign = 0u - static_cast<unsigned int>(bin < 0);
+        const unsigned int tcms = (static_cast<unsigned int>(bin) << 1) ^ sign;
+        const unsigned int code = ((tcms + 1) << 1) | (orig_i >> 31);
+        output = signexpomask | code;
       }
     }
-    data_out_i[i] = (output ^ signexpomask) - 1;
+    return (output ^ signexpomask) - 1;
   }
-}
+};
 
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
-static __global__ __launch_bounds__(TPB, 3)
-#else
-static __global__ __launch_bounds__(TPB, 2)
-#endif
-void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, const float errorbound, const float threshold)
+struct RelQuantizer
 {
-  // allocate shared memory buffer
-  __shared__ long long chunk [3 * (CS / sizeof(long long))];
+  float errorbound;
+  float threshold;
 
-  // split into 3 shared memory buffers
-  byte* in = (byte*)&chunk[0 * (CS / sizeof(long long))];
-  byte* out = (byte*)&chunk[1 * (CS / sizeof(long long))];
-  byte* const temp = (byte*)&chunk[2 * (CS / sizeof(long long))];
+  __device__ float stored_error_bound() const { return errorbound; }
 
-  // initialize
-  const int tid = threadIdx.x;
-  const int last = 3 * (CS / sizeof(long long)) - 2 - WS;
-  const int chunks = (insize + CS - 1) / CS;  // round up
-  long long* const head_out = (long long*)output;
-  unsigned short* const size_out = (unsigned short*)&head_out[2];
-  byte* const data_out = (byte*)&size_out[chunks];
+  __device__ RelWordQuantizer prepare() const
+  {
+    const float log2eb = 2 * d_REL_log2approxf(1 + errorbound);
+    return {errorbound, threshold, log2eb, 1 / log2eb};
+  }
 
-  // loop over chunks
-  do {
-    // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
-    __syncthreads();  // chunk[last] produced, chunk consumed
+  __device__ void operator()(int csize, byte* slab) const
+  {
+    quantize_chunk_in_place(csize, slab, prepare());
+  }
 
-    // terminate if done
-    const int chunkID = chunk[last];
-    const int base = chunkID * CS;
-    if (base >= insize) break;
-
-    // load chunk
-    const int osize = min(CS, insize - base);
-    long long* const input_l = (long long*)&input[base];
-    long long* const out_l = (long long*)out;
-    for (int i = tid; i < osize / 8; i += TPB) {
-      out_l[i] = input_l[i];
-    }
-    const int extra = osize % 8;
-    if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-
-    // encode chunk
-    __syncthreads();  // chunk produced, chunk[last] consumed
-    int csize = osize;
-    bool good = true;
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_QREL_4(csize, in, out, errorbound, threshold);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_DIFFNB_4(csize, in, out, temp);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_BIT_4(csize, in, out, temp);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      good = d_RZE_1(csize, in, out, temp);
-      __syncthreads();
-    }
-
-    // handle carry
-    if (!good || (csize >= osize)) csize = osize;
-    propagate_carry(csize, chunkID, fullcarry, (int*)temp);
-
-    // reload chunk if incompressible
-    if (tid == 0) size_out[chunkID] = csize;
-    if (csize == osize) {
-      // store original data
-      long long* const out_l = (long long*)out;
-      for (int i = tid; i < osize / 8; i += TPB) {
-        out_l[i] = input_l[i];
-      }
-      const int extra = osize % 8;
-      if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-    }
-    __syncthreads();  // "out" done, temp produced
-
-    // store chunk
-    const int offs = (chunkID == 0) ? 0 : *((int*)temp);
-    s2g(&data_out[offs], out, csize);
-
-    // finalize if last chunk
-    if ((tid == 0) && (base + CS >= insize)) {
-      // output header
-      head_out[0] = (long long)insize;
-      float* const head_out_f = (float*)&head_out[1];
-      head_out_f[0] = errorbound;
-      // compute compressed size
-      *outsize = &data_out[fullcarry[chunkID]] - output;
-    }
-  } while (true);
-}
+  __device__ void load_full(const byte* source, byte* slab) const
+  {
+    load_quantized_full_chunk(source, slab, prepare());
+  }
+};
 
 
 struct GPUTimer
@@ -363,7 +176,7 @@ static void CheckHip(const int line)
 }
 
 
-int main(int argc, char* argv [])
+int main(int argc, char* argv []) try
 {
   printf("PFPL GPU Single-Precision REL Compressor\n");
   printf("Copyright 2025 Texas State University\n\n");
@@ -371,15 +184,8 @@ int main(int argc, char* argv [])
   // read input from file
   if (argc < 4 || argc > 5) {printf("USAGE: %s input_file_name compressed_file_name error_bound [threshold]\n\n", argv[0]);  throw std::runtime_error("LC error");}
 
-  FILE* const fin = fopen(argv[1], "rb");
-  fseek(fin, 0, SEEK_END);
-  const long long fsize = ftell(fin);
-  if (fsize <= 0) {fprintf(stderr, "ERROR: input file too small\n\n"); throw std::runtime_error("LC error");}
-  if (fsize >= 2147221529) {fprintf(stderr, "ERROR: input file too large\n\n"); throw std::runtime_error("LC error");}
-  byte* const input = new byte [fsize];
-  fseek(fin, 0, SEEK_SET);
-  const int insize = fread(input, 1, fsize, fin);  assert(insize == fsize);
-  fclose(fin);
+  int insize;
+  const auto input = read_f32_input(argv[1], insize);
   printf("original size: %d bytes\n", insize);
 
   // get GPU info
@@ -390,22 +196,22 @@ int main(int argc, char* argv [])
   const int SMs = deviceProp.multiProcessorCount;
   const int mTpSM = deviceProp.maxThreadsPerMultiProcessor;
   const int blocks = SMs * (mTpSM / TPB);
-  const int chunks = (insize + CS - 1) / CS;  // round up
+  const int chunks = 1 + (insize - 1) / CS;
   CheckHip(__LINE__);
-  const int maxsize = 3 * sizeof(int) + chunks * sizeof(short) + chunks * CS;
+  const std::size_t maxsize = 16 + 2 * static_cast<std::size_t>(chunks) + insize;
 
   // allocate GPU memory
   byte* dencoded;
-  hipHostMalloc((void **)&dencoded, maxsize);
+  check_compression_hip(hipHostMalloc((void**)&dencoded, maxsize), "allocate host packet buffer");
   byte* d_input;
-  hipMalloc((void **)&d_input, insize);
-  hipMemcpy(d_input, input, insize, hipMemcpyHostToDevice);
+  check_compression_hip(hipMalloc((void**)&d_input, insize), "allocate compression input");
+  check_compression_hip(hipMemcpy(d_input, input.get(), insize, hipMemcpyHostToDevice),
+                        "transfer compression input");
   byte* d_encoded;
-  hipMalloc((void **)&d_encoded, maxsize);
+  check_compression_hip(hipMalloc((void**)&d_encoded, maxsize), "allocate compression packet buffer");
   int* d_encsize;
-  hipMalloc((void **)&d_encsize, sizeof(int));
-  int* d_fullcarry;
-  hipMalloc((void**)&d_fullcarry, chunks * sizeof(int));
+  check_compression_hip(hipMalloc((void**)&d_encsize, sizeof(int)), "allocate packet size");
+  const EncodeScratch scratch(insize);
   CheckHip(__LINE__);
 
   const float errorbound = atof(argv[3]);
@@ -416,9 +222,8 @@ int main(int argc, char* argv [])
     hipDeviceSynchronize();
     dtimer.start();
 
-    d_reset<<<1, 1>>>();
-    hipMemset(d_fullcarry, 0, chunks * sizeof(int));
-    d_encode<<<blocks, TPB>>>(d_input, insize, d_encoded, d_encsize, d_fullcarry, errorbound, threshold);
+    submit_encode(d_input, insize, d_encoded, d_encsize, scratch, blocks,
+                  RelQuantizer{errorbound, threshold});
 
     hipDeviceSynchronize();
     double runtime = dtimer.stop();
@@ -433,16 +238,18 @@ int main(int argc, char* argv [])
 
   // get encoded GPU result
   int dencsize = 0;
-  hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost);
-  hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost);
+  check_compression_hip(hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost),
+                        "read packet size");
+  if (dencsize <= 0 || static_cast<std::size_t>(dencsize) > maxsize)
+    throw std::runtime_error("Encoded packet size is outside the supported range");
+  check_compression_hip(hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost),
+                        "read encoded packet");
   printf("encoded size: %d bytes\n", dencsize);
   printf("compression ratio: %.2f\n", 1.0 * insize / dencsize);
   CheckHip(__LINE__);
 
   // write to file
-  FILE* const fout = fopen(argv[2], "wb");
-  fwrite(dencoded, 1, dencsize, fout);
-  fclose(fout);
+  write_f32_output(argv[2], dencoded, dencsize);
 
   // clean up GPU memory
   hipFree(d_input);
@@ -451,7 +258,11 @@ int main(int argc, char* argv [])
   CheckHip(__LINE__);
 
   // clean up
-  delete [] input;
   hipHostFree(dencoded);
   return 0;
+}
+catch (const std::exception& error)
+{
+  fprintf(stderr, "%s\n", error.what());
+  return 1;
 }

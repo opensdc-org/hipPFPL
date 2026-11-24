@@ -52,180 +52,108 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #include <cassert>
 #include <stdexcept>
 #include <hip/hip_runtime.h>
-#include <sys/time.h>
 #include "include/macros.h"
 #include "include/sum_reduction.h"
-#include "include/max_scan.h"
 #include "include/chunk_offsets.h"
 #include "components/d_BIT_4.h"
+#define PFPL_F32_ABS_RZE_ENCODE
 #include "components/d_RZE_1.h"
+#undef PFPL_F32_ABS_RZE_ENCODE
+#define PFPL_ABS_EARLY_RZE_UPPER
+#include "include/f32_encode_common.h"
+#undef PFPL_ABS_EARLY_RZE_UPPER
+#include "include/f32_file_io.h"
 
 
 const int NUM_RUNS = 9;
 
 
-// copy (len) bytes from shared memory (source) to global memory (destination)
-// source must we word aligned
-static inline __device__ void s2g(void* const __restrict__ destination, const void* const __restrict__ source, const int len)
+// Merge the magnitude threshold and the raw-NaN check into one comparison.
+static __device__ __forceinline__ unsigned int d_QABS_4_cutoff(float threshold)
 {
-  const int tid = threadIdx.x;
-  const byte* const __restrict__ input = (byte*)source;
-  byte* const __restrict__ output = (byte*)destination;
-  if (len < 128) {
-    if (tid < len) output[tid] = input[tid];
-  } else {
-    const int nonaligned = (int)(size_t)output;
-    const int wordaligned = (nonaligned + 3) & ~3;
-    const int linealigned = (nonaligned + 127) & ~127;
-    const int bcnt = wordaligned - nonaligned;
-    const int wcnt = (linealigned - wordaligned) / 4;
-    const int* const __restrict__ in_w = (int*)input;
-    if (bcnt == 0) {
-      int* const __restrict__ out_w = (int*)output;
-      if (tid < wcnt) out_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < len / 4; i += TPB) {
-        out_w[i] = in_w[i];
-      }
-      if (tid < (len & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
-    } else {
-      const int shift = bcnt * 8;
-      const int rlen = len - bcnt;
-      int* const __restrict__ out_w = (int*)&output[bcnt];
-      if (tid < bcnt) output[tid] = input[tid];
-      if (tid < wcnt) out_w[tid] = __funnelshift_r(in_w[tid], in_w[tid + 1], shift);
-      for (int i = tid + wcnt; i < rlen / 4; i += TPB) {
-        out_w[i] = __funnelshift_r(in_w[i], in_w[i + 1], shift);
-      }
-      if (tid < (rlen & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
-    }
-  }
+  constexpr unsigned int infinity = 0x7f800000u;
+  const unsigned int bits = __float_as_uint(threshold);
+  const unsigned int magnitude = bits & 0x7fffffffu;
+  if (magnitude > infinity) return infinity + 1;
+  if ((bits >> 31) != 0) return 0;
+  // A device that compares subnormals as zero already rejects every value.
+  if (magnitude < 0x00800000u && threshold == 0.0f) return 0;
+  return magnitude;
 }
 
 
-static inline __device__ void propagate_carry(const int value, const int chunkID, volatile int* const __restrict__ fullcarry, int* const __restrict__ s_fullc)
+static __device__ __forceinline__ unsigned int d_QABS_4_word(
+    unsigned int original_bits, float errorbound, unsigned int cutoff, float eb2, float inv_eb2)
 {
-  if (threadIdx.x == TPB - 1) {  // last thread
-    fullcarry[chunkID] = (chunkID == 0) ? value : -value;
-  }
+  const int maxbin = 1 << 22;  // Leave one mantissa bit for sign.
+  const float original = __uint_as_float(original_bits);
+  const float scaled = original * inv_eb2;
+  const int bin = static_cast<int>(roundf(scaled));
+  const float reconstructed = bin * eb2;
 
-  if (chunkID != 0) {
-    if (threadIdx.x + WS >= TPB) {  // last warp
-      const int lane = threadIdx.x % WS;
-      const int cidm1ml = chunkID - 1 - lane;
-      int val = -1;
-      pfpl_syncwarp();  // not optional
-      do {
-        if (cidm1ml >= 0) {
-          val = fullcarry[cidm1ml];
-        }
-      } while ((pfpl_any_sync(~0, val == 0)) || (pfpl_all_sync(~0, val <= 0)));
-#if defined(WS) && (WS == 64)
-      const long long mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffsll(mask) - 1;
-#else
-      const int mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffs(mask) - 1;
-#endif
-      int partc = (lane < pos) ? -val : 0;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-      partc = __reduce_add_sync(~0, partc);
-#else
-      partc += pfpl_shfl_xor_sync(~0, partc, 1);
-      partc += pfpl_shfl_xor_sync(~0, partc, 2);
-      partc += pfpl_shfl_xor_sync(~0, partc, 4);
-      partc += pfpl_shfl_xor_sync(~0, partc, 8);
-      partc += pfpl_shfl_xor_sync(~0, partc, 16);
-#endif
-      if (lane == pos) {
-        const int fullc = partc + val;
-        fullcarry[chunkID] = fullc + value;
-        *s_fullc = fullc;
-      }
-    }
+  if ((bin >= maxbin) || (bin <= -maxbin) || ((original_bits & 0x7fffffffu) >= cutoff) ||
+      (fabsf(original - reconstructed) > errorbound)) {
+    return original_bits;
   }
-}
-
-
-static __device__ inline void load_raw_chunk(const byte* source, byte* slab, int bytes)
-{
-  const int tid = threadIdx.x;
-  const auto* source_words = reinterpret_cast<const long long*>(source);
-  auto* slab_words = reinterpret_cast<long long*>(slab);
-  for (int i = tid; i < bytes / 8; i += TPB) {
-    slab_words[i] = source_words[i];
-  }
-  const int extra = bytes % 8;
-  if (tid < extra) slab[bytes - extra + tid] = source[bytes - extra + tid];
+  const unsigned int sign = 0u - static_cast<unsigned int>(bin < 0);
+  return (static_cast<unsigned int>(bin) << 1) ^ sign;
 }
 
 
 static __device__ inline void d_QABS_4_in_place(int csize, byte* slab, float errorbound, float threshold)
 {
   const int words = csize / sizeof(float);
-  const int maxbin = 1 << 22;  // Leave one mantissa bit for sign.
   const float eb2 = 2 * errorbound;
   const float inv_eb2 = 0.5f / errorbound;
+  const unsigned int cutoff = d_QABS_4_cutoff(threshold);
   auto* values = reinterpret_cast<unsigned int*>(slab);
 
   for (int i = threadIdx.x; i < words; i += TPB) {
-    const unsigned int original_bits = values[i];
-    const float original = __uint_as_float(original_bits);
-    const float scaled = original * inv_eb2;
-    const int bin = static_cast<int>(roundf(scaled));
-    const float reconstructed = bin * eb2;
-
-    if ((bin >= maxbin) || (bin <= -maxbin) || (fabsf(original) >= threshold) ||
-        (fabsf(original - reconstructed) > errorbound) || (original != original)) {
-      values[i] = original_bits;
-    } else {
-      const unsigned int sign = 0u - static_cast<unsigned int>(bin < 0);
-      values[i] = (static_cast<unsigned int>(bin) << 1) ^ sign;
-    }
+    values[i] = d_QABS_4_word(values[i], errorbound, cutoff, eb2, inv_eb2);
   }
 }
 
 
-static __device__ inline void d_DIFFNB_BIT_4_in_place(int csize, byte* slab)
+// Full chunks already have the pair alignment used by load_raw_chunk.
+static __device__ inline void load_quantized_full_chunk(const byte* source, byte* slab,
+                                                         float errorbound, float threshold)
 {
-  constexpr int width = 32;
-  constexpr int words_per_thread = CS / sizeof(unsigned int) / TPB;
-  constexpr unsigned int bias = 0xAAAAAAAAu;
-  static_assert(CS % (sizeof(unsigned int) * TPB) == 0 && TPB % width == 0);
-
-  auto* words = reinterpret_cast<unsigned int*>(slab);
-  const int count = csize / sizeof(unsigned int);
-  const int transposed = count - count % width;
+  using Pair = unsigned long long;
+  constexpr int pairs_per_thread = CS / (sizeof(Pair) * TPB);
+  static_assert(sizeof(Pair) == 8 && sizeof(unsigned int) == 4 && CS % (sizeof(Pair) * TPB) == 0);
+  const auto* input_pairs = reinterpret_cast<const Pair*>(source);
+  auto* output_pairs = reinterpret_cast<Pair*>(slab);
   const int tid = threadIdx.x;
-  const int lane = tid % width;
-  // Spread the full chunk's bit-plane stores across LDS banks.
-  const int bank_mask = (csize == CS) ? lane : 0;
-  unsigned int staged[words_per_thread];
+  const float eb2 = 2 * errorbound;
+  const float inv_eb2 = 0.5f / errorbound;
+  const unsigned int cutoff = d_QABS_4_cutoff(threshold);
+
+  if ((reinterpret_cast<std::size_t>(source) & 15u) == 0) {
+    constexpr int words_per_vector = 4;
+    constexpr int vectors_per_thread = CS / (sizeof(uint4) * TPB);
+    static_assert(sizeof(uint4) == words_per_vector * sizeof(unsigned int) && CS % (sizeof(uint4) * TPB) == 0);
+    const auto* vectors = reinterpret_cast<const uint4*>(source);
+    #pragma unroll
+    for (int row = 0; row < vectors_per_thread; ++row) {
+      const int i = tid + row * TPB;
+      const uint4 raw = vectors[i];
+      const unsigned int a = d_QABS_4_word(raw.x, errorbound, cutoff, eb2, inv_eb2);
+      const unsigned int b = d_QABS_4_word(raw.y, errorbound, cutoff, eb2, inv_eb2);
+      const unsigned int c = d_QABS_4_word(raw.z, errorbound, cutoff, eb2, inv_eb2);
+      const unsigned int d = d_QABS_4_word(raw.w, errorbound, cutoff, eb2, inv_eb2);
+      output_pairs[2 * i] = (static_cast<Pair>(b) << 32) | a;
+      output_pairs[2 * i + 1] = (static_cast<Pair>(d) << 32) | c;
+    }
+    return;
+  }
 
   #pragma unroll
-  for (int row = 0; row < words_per_thread; ++row) {
+  for (int row = 0; row < pairs_per_thread; ++row) {
     const int i = tid + row * TPB;
-    if (i < count) {
-      const unsigned int previous = (i == 0) ? 0u : words[i - 1];
-      const unsigned int diff = ((words[i] - previous) + bias) ^ bias;
-      // In a partial chunk the remaining complete words are differenced
-      // without a bit transpose. Only whole logical warps call the shuffle.
-      staged[row] = (i < transposed) ? d_BIT_4_word(diff, lane) : diff;
-    }
-  }
-  __syncthreads();  // Permuted writes can overlap any lane's old input.
-  #pragma unroll
-  for (int row = 0; row < words_per_thread; ++row) {
-    const int i = tid + row * TPB;
-    if (i < count) {
-      const int out = (i < transposed) ? i / width + lane * (transposed / width) : i;
-      words[out ^ bank_mask] = staged[row];
-    }
+    const Pair original = input_pairs[i];
+    const unsigned int low = d_QABS_4_word(static_cast<unsigned int>(original), errorbound, cutoff, eb2, inv_eb2);
+    const unsigned int high = d_QABS_4_word(static_cast<unsigned int>(original >> 32), errorbound, cutoff, eb2, inv_eb2);
+    output_pairs[i] = (static_cast<Pair>(high) << 32) | low;
   }
 }
 
@@ -238,11 +166,8 @@ static __global__ __launch_bounds__(TPB, 2)
 void d_encode_legacy(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, int* const next_chunk_counter,
                      const float errorbound, const float threshold)
 {
-  // The byte-RZE bitmap follows WS+1 scan words in the shared scratch.
-  constexpr int scratch_bytes = (WS + 1) * sizeof(int) + 2048 + 256 + 32 + 4;
-  static_assert(scratch_bytes % sizeof(int) == 0);
   __shared__ long long chunk[CS / sizeof(long long)];
-  __shared__ int scratch[scratch_bytes / sizeof(int)];
+  __shared__ int scratch[rze_scratch_bytes / sizeof(int)];
   __shared__ int next_chunk;
 
   auto* slab = reinterpret_cast<byte*>(chunk);
@@ -294,108 +219,55 @@ void d_encode_legacy(const byte* const __restrict__ input, const int insize, byt
 }
 
 
-// Fuse the full-chunk bit transpose with byte zero elimination. Each logical
-// warp handles a consecutive span of input, so a lane produces an entire
-// 32-byte segment of one bit plane and can retain it rather than staging it.
-static __device__ inline bool d_DIFFNB_BIT_ZE_4_full_chunk(int& csize, byte* slab,
-                                                          int* scratch, int* counts)
-{
-  static_assert(CS == 16384 && TPB == 512 && WS == 32);
-  constexpr int word_bytes = sizeof(unsigned int);
-  constexpr int rows_per_warp = CS / word_bytes / TPB;
-  constexpr int warps = TPB / WS;
-  constexpr unsigned int bias = 0xAAAAAAAAu;
-  const int tid = threadIdx.x;
-  const int lane = tid % WS;
-  const int warp = tid / WS;
-  const int group = lane * warps + warp;
-  // XOR the low address bits to disperse both the bit-plane-order scan and
-  // the logical-warp-ordered reads and writes across LDS banks.
-  const int scatter_index = group ^ (group / warps);
-  const int scan_index = tid ^ (tid / warps);
-  const auto* words = reinterpret_cast<const unsigned int*>(slab);
-  unsigned int transformed[rows_per_warp];
-  unsigned int bits = 0;
-
-  #pragma unroll
-  for (int row = 0; row < rows_per_warp; ++row) {
-    const int i = (warp * rows_per_warp + row) * WS + lane;
-    const unsigned int previous = (i == 0) ? 0u : words[i - 1];
-    const unsigned int diff = ((words[i] - previous) + bias) ^ bias;
-    const unsigned int word = d_BIT_4_word(diff, lane);
-    transformed[row] = word;
-    bits |= d_nonzero_byte_mask(word) << (4 * row);
-  }
-
-  const int nonzero = __popc(bits);
-  counts[scatter_index] = nonzero;
-  if (tid < WS) scratch[tid] = 0;
-  __syncthreads();  // All counts and all reads of the quantized input are complete.
-  const int group_count = counts[scan_index];
-  const int inclusive = block_prefix_sum(group_count, scratch);
-  counts[scan_index] = inclusive - group_count;
-  if (tid == TPB - 1) scratch[WS] = inclusive;
-  __syncthreads();  // Publish exclusive offsets in bit-plane order.
-
-  auto* bitmap = reinterpret_cast<unsigned int*>(scratch + WS + 1);
-  bitmap[group] = bits;
-  int pos = counts[scatter_index];
-  #pragma unroll
-  for (int i = 0; i < rows_per_warp * word_bytes; ++i) {
-    if ((bits >> i) & 1u) {
-      slab[pos++] = transformed[i / word_bytes] >> ((i % word_bytes) * 8);
-    }
-  }
-  return d_RZE_finish<byte, true>(csize, slab, slab, reinterpret_cast<byte*>(scratch), scratch[WS]);
-}
-
-
-// Bound staging to 64 MiB regardless of the input size. Every window is
-// completed in stream order before its slots and offsets can be reused.
-static constexpr int STAGED_CHUNK_LIMIT = 4096;
-
-
 static __global__ __launch_bounds__(TPB, 2)
 void d_encode_staged(const byte* const __restrict__ input, const int insize,
                      const int first, byte* const __restrict__ staging,
                      unsigned short* const __restrict__ lengths,
                      const float errorbound, const float threshold)
 {
-  constexpr int scratch_bytes = (WS + 1) * sizeof(int) + 2048 + 256 + 32 + 4;
-  static_assert(scratch_bytes % sizeof(int) == 0);
-  __shared__ long long chunk[CS / sizeof(long long)];
-  __shared__ int scratch[scratch_bytes / sizeof(int)];
-  __shared__ int counts[TPB];
+  __shared__ uint4 chunk[CS / sizeof(uint4)];
+  __shared__ int scratch[rze_scratch_bytes / sizeof(int)];
   auto* slab = reinterpret_cast<byte*>(chunk);
 
   const int slot = blockIdx.x;
   const int chunk_id = first + slot;
   const int base = chunk_id * CS;
   const int raw_size = min(CS, insize - base);
-  load_raw_chunk(&input[base], slab, raw_size);
-  __syncthreads();
-  d_QABS_4_in_place(raw_size, slab, errorbound, threshold);
-  __syncthreads();
   int csize = raw_size;
   bool good;
   if (raw_size == CS) {
-    good = d_DIFFNB_BIT_ZE_4_full_chunk(csize, slab, scratch, counts);
+    load_quantized_full_chunk(&input[base], slab, errorbound, threshold);
+    __syncthreads();
+    good = d_DIFFNB_BIT_ZE_4_full_chunk(csize, slab, scratch);
   } else {
+    load_raw_chunk(&input[base], slab, raw_size);
+    __syncthreads();
+    d_QABS_4_in_place(raw_size, slab, errorbound, threshold);
+    __syncthreads();
     d_DIFFNB_BIT_4_in_place(raw_size, slab);
     __syncthreads();
     good = d_RZE_1_in_place(csize, slab, reinterpret_cast<byte*>(scratch));
+    __syncthreads();
   }
-  __syncthreads();
   if (!good || csize >= raw_size) csize = raw_size;
   if (threadIdx.x == 0) lengths[chunk_id] = static_cast<unsigned short>(csize);
 
   // Raw fallback is packed from the original input, so its slot is unused.
   if (csize < raw_size) {
     byte* slot_data = &staging[slot * CS];
-    s2g(slot_data, slab, csize);
-    // A later unaligned word copy can load up to the next 4-byte boundary.
-    const int padding = (4 - (csize & 3)) & 3;
-    if (threadIdx.x < padding) slot_data[csize + threadIdx.x] = 0;
+    // Both the shared chunk and the hipMalloc staging slots are 16-byte aligned.
+    static_assert(sizeof(uint4) == 16 && CS % sizeof(uint4) == 0);
+    constexpr int width = sizeof(uint4);
+    const auto* source = reinterpret_cast<const uint4*>(slab);
+    auto* destination = reinterpret_cast<uint4*>(slot_data);
+    const int tid = threadIdx.x;
+    const int vectors = csize / width;
+    for (int i = tid; i < vectors; i += TPB) destination[i] = source[i];
+
+    // Pad only through the last word that the subsequent pack can load.
+    const int tail = vectors * width + tid;
+    const int padded = (csize + 3) & ~3;
+    if (tail < padded) slot_data[tail] = (tail < csize) ? slab[tail] : 0;
   }
 }
 
@@ -431,28 +303,56 @@ void d_scan_staged_offsets(const unsigned short* const __restrict__ lengths,
 }
 
 
+// A block sums the completed lengths preceding its slots independently.
+// This adds bounded reads of the directory and needs no inter-block ordering.
 static __global__ __launch_bounds__(TPB)
-void d_pack_staged(const byte* const __restrict__ input, const int insize,
-                   const int first, const int chunks, const byte* const __restrict__ staging,
-                   const int* const __restrict__ offsets, const unsigned short* const __restrict__ lengths,
-                   byte* const output, const int* const __restrict__ outsize)
+void d_scan_pack_staged(const byte* const __restrict__ input, const int insize,
+                        const int chunks, const byte* const __restrict__ staging,
+                        const unsigned short* const __restrict__ lengths,
+                        byte* const output, int* const __restrict__ outsize, float errorbound)
 {
-  if (*outsize <= 0) return;
-  const int slot = blockIdx.x;
-  const int chunk_id = first + slot;
-  const int base = chunk_id * CS;
-  const int raw_size = min(CS, insize - base);
-  const int length = lengths[chunk_id];
-  const bool raw = (length == raw_size);
-  const byte* source = raw ? &input[base] : &staging[slot * CS];
-  auto* destination = &output[16 + 2 * chunks + offsets[slot]];
+  constexpr int lengths_per_word = 4;
+  static_assert(TPB % PACK_THREADS_PER_SLOT == 0);
+  static_assert(PACK_SLOTS_PER_BLOCK % lengths_per_word == 0 && PACK_SLOTS_PER_BLOCK <= WS);
+  static_assert((static_cast<long long>(CS) + 2) * STAGED_CHUNK_LIMIT + 16 <= INT_MAX);
+  __shared__ unsigned int reduce_scratch[WS];
+  __shared__ int local_offsets[PACK_SLOTS_PER_BLOCK + 1];
 
-  if (raw && (length & 3)) {
-    // Do not read a partial terminal word past the original input allocation.
-    for (int i = threadIdx.x; i < length; i += TPB) destination[i] = source[i];
-  } else {
-    s2g(destination, source, length);
+  const int tid = threadIdx.x;
+  const int block_start = blockIdx.x * PACK_SLOTS_PER_BLOCK;
+  const auto* length_words = reinterpret_cast<const unsigned long long*>(lengths);
+  unsigned int sum = 0;
+  for (int i = tid; i < block_start / lengths_per_word; i += TPB) {
+    const unsigned long long word = length_words[i];
+    sum += (word & 0xffffu) + ((word >> 16) & 0xffffu) +
+           ((word >> 32) & 0xffffu) + (word >> 48);
   }
+
+  write_local_pack_offsets(tid, block_start, chunks, lengths, local_offsets);
+  // The reduction also publishes the first warp's local offsets to every slot.
+  const int payload_base = static_cast<int>(fused_pack_block_sum(sum, reduce_scratch));
+  const int directory_bytes = 16 + 2 * chunks;
+  if (tid == 0) {
+    if (block_start == 0) {
+      reinterpret_cast<long long*>(output)[0] = insize;
+      reinterpret_cast<float*>(output)[2] = errorbound;
+      reinterpret_cast<unsigned int*>(output)[3] = 0;
+    }
+    if (block_start + PACK_SLOTS_PER_BLOCK >= chunks) {
+      *outsize = directory_bytes + payload_base + local_offsets[PACK_SLOTS_PER_BLOCK];
+    }
+  }
+
+  const int local_slot = tid / PACK_THREADS_PER_SLOT;
+  const int slot = block_start + local_slot;
+  if (slot >= chunks) return;
+  const int base = slot * CS;
+  const int raw_size = min(CS, insize - base);
+  const int length = lengths[slot];
+  const bool raw = (length == raw_size);
+  const byte* source = raw ? &input[base] : &staging[base];
+  byte* destination = output + directory_bytes + payload_base + local_offsets[local_slot];
+  copy_staged_packet<PACK_THREADS_PER_SLOT>(destination, source, length);
 }
 
 
@@ -464,6 +364,13 @@ static void submit_staged_encode(const byte* input, int insize, byte* output, in
 {
   const int chunks = 1 + (insize - 1) / CS;
   auto* lengths = reinterpret_cast<unsigned short*>(output + 16);
+  if (chunks <= STAGED_CHUNK_LIMIT) {
+    const int blocks = (chunks + PACK_SLOTS_PER_BLOCK - 1) / PACK_SLOTS_PER_BLOCK;
+    d_encode_staged<<<chunks, TPB, 0, stream>>>(input, insize, 0, staging, lengths, errorbound, threshold);
+    d_scan_pack_staged<<<blocks, TPB, 0, stream>>>(input, insize, chunks, staging, lengths,
+                                                 output, outsize, errorbound);
+    return;
+  }
   for (int first = 0; first < chunks; first += STAGED_CHUNK_LIMIT) {
     const int remaining = chunks - first;
     const int count = (remaining < STAGED_CHUNK_LIMIT) ? remaining : STAGED_CHUNK_LIMIT;
@@ -474,53 +381,6 @@ static void submit_staged_encode(const byte* input, int insize, byte* output, in
                                           output, outsize);
   }
 }
-
-
-static void check_compression_hip(hipError_t status, const char* operation)
-{
-  if (status != hipSuccess) {
-    throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(status));
-  }
-}
-
-
-struct EncodeScratch
-{
-  explicit EncodeScratch(int insize)
-  {
-    const int chunks = 1 + (insize - 1) / CS;
-    const int cap = (chunks < STAGED_CHUNK_LIMIT) ? chunks : STAGED_CHUNK_LIMIT;
-    // Align the offsets following the staging area for grouped int4 stores.
-    constexpr std::size_t offset_alignment = alignof(int4);
-    const std::size_t aligned_input = (static_cast<std::size_t>(insize) + offset_alignment - 1)
-                                   & ~(offset_alignment - 1);
-    const std::size_t window_bytes = static_cast<std::size_t>(cap) * CS;
-    staging_bytes = (aligned_input < window_bytes) ? aligned_input : window_bytes;
-
-    // One allocation owns both the aligned packet slots and the int offsets.
-    void* allocated = nullptr;
-    const auto status = hipMalloc(&allocated, staging_bytes + static_cast<std::size_t>(cap) * sizeof(int));
-    if (status == hipSuccess) {
-      storage = allocated;
-      return;
-    }
-    if (status != hipErrorOutOfMemory) check_compression_hip(status, "allocate staged compression scratch");
-    // Only the expected out-of-memory result selects the small fallback.
-    static_cast<void>(hipGetLastError());
-    allocated = nullptr;
-    staging_bytes = 0;
-    check_compression_hip(hipMalloc(&allocated, static_cast<std::size_t>(chunks + 1) * sizeof(int)),
-                          "allocate fallback compression scratch");
-    storage = allocated;
-  }
-
-  EncodeScratch(const EncodeScratch&) = delete;
-  EncodeScratch& operator=(const EncodeScratch&) = delete;
-  ~EncodeScratch() { static_cast<void>(hipFree(storage)); }
-
-  void* storage = nullptr;
-  std::size_t staging_bytes = 0;
-};
 
 
 static void submit_legacy_encode(const byte* input, int insize, byte* output, int* outsize,
@@ -571,7 +431,7 @@ static void CheckHip(const int line)
 }
 
 
-int main(int argc, char* argv [])
+int main(int argc, char* argv []) try
 {
   printf("PFPL GPU Single-Precision ABS Compressor\n");
   printf("Copyright 2025 Texas State University\n\n");
@@ -579,15 +439,8 @@ int main(int argc, char* argv [])
   // read input from file
   if (argc < 4 || argc > 5) {printf("USAGE: %s input_file_name compressed_file_name error_bound [threshold]\n\n", argv[0]);  throw std::runtime_error("LC error");}
 
-  FILE* const fin = fopen(argv[1], "rb");
-  fseek(fin, 0, SEEK_END);
-  const long long fsize = ftell(fin);
-  if (fsize <= 0) {fprintf(stderr, "ERROR: input file too small\n\n"); throw std::runtime_error("LC error");}
-  if (fsize >= 2147221529) {fprintf(stderr, "ERROR: input file too large\n\n"); throw std::runtime_error("LC error");}
-  byte* const input = new byte [fsize];
-  fseek(fin, 0, SEEK_SET);
-  const int insize = fread(input, 1, fsize, fin);  assert(insize == fsize);
-  fclose(fin);
+  int insize;
+  const auto input = read_f32_input(argv[1], insize);
   printf("original size: %d bytes\n", insize);
 
   // get GPU info
@@ -605,7 +458,7 @@ int main(int argc, char* argv [])
   check_compression_hip(hipHostMalloc((void**)&dencoded, maxsize), "allocate host packet buffer");
   byte* d_input;
   check_compression_hip(hipMalloc((void**)&d_input, insize), "allocate compression input");
-  check_compression_hip(hipMemcpy(d_input, input, insize, hipMemcpyHostToDevice), "transfer compression input");
+  check_compression_hip(hipMemcpy(d_input, input.get(), insize, hipMemcpyHostToDevice), "transfer compression input");
   byte* d_encoded;
   check_compression_hip(hipMalloc((void**)&d_encoded, maxsize), "allocate compression packet buffer");
   int* d_encsize;
@@ -637,20 +490,20 @@ int main(int argc, char* argv [])
 
   // get encoded GPU result
   int dencsize = 0;
-  hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost);
+  check_compression_hip(hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost),
+                        "read packet size");
   if (dencsize <= 0 || static_cast<std::size_t>(dencsize) > maxsize) {
     fprintf(stderr, "ERROR: encoded packet size is outside the supported range\n\n");
     throw std::runtime_error("LC error");
   }
-  hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost);
+  check_compression_hip(hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost),
+                        "read encoded packet");
   printf("encoded size: %d bytes\n", dencsize);
   printf("compression ratio: %.2f\n", 1.0 * insize / dencsize);
   CheckHip(__LINE__);
 
   // write to file
-  FILE* const fout = fopen(argv[2], "wb");
-  fwrite(dencoded, 1, dencsize, fout);
-  fclose(fout);
+  write_f32_output(argv[2], dencoded, dencsize);
 
   // clean up GPU memory
   hipFree(d_input);
@@ -659,7 +512,11 @@ int main(int argc, char* argv [])
   CheckHip(__LINE__);
 
   // clean up
-  delete [] input;
   hipHostFree(dencoded);
   return 0;
+}
+catch (const std::exception& error)
+{
+  fprintf(stderr, "%s\n", error.what());
+  return 1;
 }

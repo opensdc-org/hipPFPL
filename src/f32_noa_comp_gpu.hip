@@ -45,261 +45,165 @@ static const int TPB = 512;  // threads per block [must be power of 2 and at lea
 #define WS 32
 
 
-#include <string>
-#include <cmath>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <hip/hip_runtime.h>
-#include <thrust/extrema.h>
-#include <thrust/execution_policy.h>
 #include <thrust/device_ptr.h>
-#include <sys/time.h>
-#include <limits>
-#include "include/macros.h"
-#include "include/sum_reduction.h"
-#include "include/max_scan.h"
-#include "include/prefix_sum.h"
-#include "components/d_DIFFNB_4.h"
-#include "components/d_BIT_4.h"
-#include "components/d_RZE_1.h"
+#include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
+#include "include/f32_staged_encode.h"
+#include "include/f32_file_io.h"
 
 
 const int NUM_RUNS = 9;
 
 
-// copy (len) bytes from shared memory (source) to global memory (destination)
-// source must we word aligned
-static inline __device__ void s2g(void* const __restrict__ destination, const void* const __restrict__ source, const int len)
+struct NoaQuantizer
 {
-  const int tid = threadIdx.x;
-  const byte* const __restrict__ input = (byte*)source;
-  byte* const __restrict__ output = (byte*)destination;
-  if (len < 128) {
-    if (tid < len) output[tid] = input[tid];
-  } else {
-    const int nonaligned = (int)(size_t)output;
-    const int wordaligned = (nonaligned + 3) & ~3;
-    const int linealigned = (nonaligned + 127) & ~127;
-    const int bcnt = wordaligned - nonaligned;
-    const int wcnt = (linealigned - wordaligned) / 4;
-    const int* const __restrict__ in_w = (int*)input;
-    if (bcnt == 0) {
-      int* const __restrict__ out_w = (int*)output;
-      if (tid < wcnt) out_w[tid] = in_w[tid];
-      for (int i = tid + wcnt; i < len / 4; i += TPB) {
-        out_w[i] = in_w[i];
-      }
-      if (tid < (len & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
+  float errorbound;
+  float threshold;
+  const float* maximum;
+  const float* minimum;
+
+  __device__ float stored_error_bound() const
+  {
+    return (*maximum - *minimum) * errorbound;
+  }
+
+  __device__ float checked_error_bound() const
+  {
+    const float adj_eb = stored_error_bound();
+    if (threshold <= adj_eb) {
+      printf("NOA QUANT: ERROR: threshold must be larger than error_bound, NOA error bound was calculated to be %e\n", adj_eb);
+      __trap();
+    }
+    return adj_eb;
+  }
+
+  __device__ void operator()(int csize, byte* slab) const
+  {
+    const float bound = checked_error_bound();
+    if (bound >= std::numeric_limits<float>::min()) {
+      quantize_chunk_in_place(csize, slab, AbsoluteWordQuantizer(bound, threshold));
+    }
+  }
+
+  __device__ void load_full(const byte* source, byte* slab) const
+  {
+    const float bound = checked_error_bound();
+    if (bound >= std::numeric_limits<float>::min()) {
+      load_quantized_full_chunk(source, slab, AbsoluteWordQuantizer(bound, threshold));
     } else {
-      const int shift = bcnt * 8;
-      const int rlen = len - bcnt;
-      int* const __restrict__ out_w = (int*)&output[bcnt];
-      if (tid < bcnt) output[tid] = input[tid];
-      if (tid < wcnt) out_w[tid] = __funnelshift_r(in_w[tid], in_w[tid + 1], shift);
-      for (int i = tid + wcnt; i < rlen / 4; i += TPB) {
-        out_w[i] = __funnelshift_r(in_w[i], in_w[i + 1], shift);
-      }
-      if (tid < (rlen & 3)) {
-        const int i = len - 1 - tid;
-        output[i] = input[i];
-      }
+      load_raw_chunk(source, slab, CS);
     }
   }
-}
+};
 
 
-static __device__ int g_chunk_counter;
+static constexpr int NOA_RANGE_THREADS = 256;
 
 
-static __global__ void d_reset()
+static __device__ inline float2 reduce_noa_wave(float2 range, int distance)
 {
-  g_chunk_counter = 0;
-}
-
-
-static inline __device__ void propagate_carry(const int value, const int chunkID, volatile int* const __restrict__ fullcarry, int* const __restrict__ s_fullc)
-{
-  if (threadIdx.x == TPB - 1) {  // last thread
-    fullcarry[chunkID] = (chunkID == 0) ? value : -value;
+  #pragma unroll
+  for (; distance > 0; distance >>= 1) {
+    range.x = fminf(range.x, pfpl_shfl_xor(range.x, distance));
+    range.y = fmaxf(range.y, pfpl_shfl_xor(range.y, distance));
   }
-
-  if (chunkID != 0) {
-    if (threadIdx.x + WS >= TPB) {  // last warp
-      const int lane = threadIdx.x % WS;
-      const int cidm1ml = chunkID - 1 - lane;
-      int val = -1;
-      pfpl_syncwarp();  // not optional
-      do {
-        if (cidm1ml >= 0) {
-          val = fullcarry[cidm1ml];
-        }
-      } while ((pfpl_any_sync(~0, val == 0)) || (pfpl_all_sync(~0, val <= 0)));
-#if defined(WS) && (WS == 64)
-      const long long mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffsll(mask) - 1;
-#else
-      const int mask = pfpl_ballot_sync(~0, val > 0);
-      const int pos = __ffs(mask) - 1;
-#endif
-      int partc = (lane < pos) ? -val : 0;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-      partc = __reduce_add_sync(~0, partc);
-#else
-      partc += pfpl_shfl_xor_sync(~0, partc, 1);
-      partc += pfpl_shfl_xor_sync(~0, partc, 2);
-      partc += pfpl_shfl_xor_sync(~0, partc, 4);
-      partc += pfpl_shfl_xor_sync(~0, partc, 8);
-      partc += pfpl_shfl_xor_sync(~0, partc, 16);
-#endif
-      if (lane == pos) {
-        const int fullc = partc + val;
-        fullcarry[chunkID] = fullc + value;
-        *s_fullc = fullc;
-      }
-    }
-  }
+  return range;
 }
 
 
-static __device__ inline void d_QNOA_4(int& csize, byte in [CS], byte out [CS], const float errorbound, const float threshold)
+static __device__ inline float2 reduce_noa_block(float2 range, float2* wave_ranges)
 {
-  using ftype = float;
-  using itype = int;
-  const int size = csize / sizeof(ftype);
+  constexpr int waves = NOA_RANGE_THREADS / WS;
+  const int lane = threadIdx.x % WS;
+  const int wave = threadIdx.x / WS;
+  range = reduce_noa_wave(range, WS / 2);
+  if (lane == 0) wave_ranges[wave] = range;
+  __syncthreads();
+  if (wave == 0) range = reduce_noa_wave(wave_ranges[lane % waves], waves / 2);
+  return range;
+}
+
+
+static __device__ inline float2 preserve_noa_zero_range(float2 range, const float* values)
+{
+  // Use the same zero for both extrema when every value compares equal to zero.
+  if (range.x == 0.0f && range.y == 0.0f) range.x = range.y = values[0];
+  return range;
+}
+
+
+static __global__ void d_noa_range_partials(const float* __restrict__ values, int count,
+                                            float2* __restrict__ ranges)
+{
+  __shared__ float2 wave_ranges[NOA_RANGE_THREADS / WS];
+  float2 range = {__builtin_inff(), -__builtin_inff()};
   const int tid = threadIdx.x;
-
-  const int mantissabits = 23;
-  const itype maxbin = 1 << (mantissabits - 1);  // leave 1 bit for sign
-
-  const ftype eb2 = 2 * errorbound;
-  const ftype inv_eb2 = 0.5f / errorbound;
-
-  const ftype* const data_f = (ftype*)in;
-  itype* const data_i = (itype*)out;
-
-  for (int i = tid; i < size; i += TPB) {
-    const ftype orig_f = data_f[i];
-    const ftype scaled = orig_f * inv_eb2;
-    const itype bin = (itype)roundf(scaled);
-    const ftype recon = bin * eb2;
-
-    itype val;
-    if ((bin >= maxbin) || (bin <= -maxbin) || (fabsf(orig_f) >= threshold) || (fabsf(orig_f - recon) > errorbound) || (orig_f != orig_f)) {  // last check is to handle NaNs
-      val = *((itype*)&orig_f);
-    } else {
-      val = (bin << 1) ^ (bin >> 31);  // TCMS encoding, 'sign' and 'exponent' fields are zero
-    }
-    data_i[i] = val;
+  const int vectors = count / 4;
+  const auto* input = reinterpret_cast<const float4*>(values);
+  const int stride = gridDim.x * NOA_RANGE_THREADS;
+  for (int index = blockIdx.x * NOA_RANGE_THREADS + tid; index < vectors; index += stride) {
+    const float4 value = input[index];
+    range.x = fminf(range.x, fminf(fminf(value.x, value.y), fminf(value.z, value.w)));
+    range.y = fmaxf(range.y, fmaxf(fmaxf(value.x, value.y), fmaxf(value.z, value.w)));
   }
+  if (blockIdx.x == 0 && tid < count % 4) {
+    const float value = values[vectors * 4 + tid];
+    range.x = fminf(range.x, value);
+    range.y = fmaxf(range.y, value);
+  }
+  range = reduce_noa_block(range, wave_ranges);
+  if (tid == 0) ranges[blockIdx.x] = gridDim.x == 1 ? preserve_noa_zero_range(range, values) : range;
 }
 
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
-static __global__ __launch_bounds__(TPB, 3)
-#else
-static __global__ __launch_bounds__(TPB, 2)
-#endif
-void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, const float errorbound, const float threshold, const float* const maxf, const float* const minf)
+static __global__ void d_noa_range_finish(const float* values, int count, float2* ranges)
 {
-  // allocate shared memory buffer
-  __shared__ long long chunk [3 * (CS / sizeof(long long))];
+  __shared__ float2 wave_ranges[NOA_RANGE_THREADS / WS];
+  float2 range = {__builtin_inff(), -__builtin_inff()};
+  for (int index = threadIdx.x; index < count; index += NOA_RANGE_THREADS) {
+    const float2 partial = ranges[index];
+    range.x = fminf(range.x, partial.x);
+    range.y = fmaxf(range.y, partial.y);
+  }
+  range = reduce_noa_block(range, wave_ranges);
+  if (threadIdx.x == 0) ranges[0] = preserve_noa_zero_range(range, values);
+}
 
-  // split into 3 shared memory buffers
-  byte* in = (byte*)&chunk[0 * (CS / sizeof(long long))];
-  byte* out = (byte*)&chunk[1 * (CS / sizeof(long long))];
-  byte* const temp = (byte*)&chunk[2 * (CS / sizeof(long long))];
 
-  // initialize
-  const int tid = threadIdx.x;
-  const int last = 3 * (CS / sizeof(long long)) - 2 - WS;
-  const int chunks = (insize + CS - 1) / CS;  // round up
-  long long* const head_out = (long long*)output;
-  unsigned short* const size_out = (unsigned short*)&head_out[2];
-  byte* const data_out = (byte*)&size_out[chunks];
-  const float adj_eb = (*maxf - *minf) * errorbound;
-  if (threshold <= adj_eb) {printf("NOA QUANT: ERROR: threshold must be larger than error_bound, NOA error bound was calculated to be %e\n", adj_eb); __trap();}
-  bool good_eb = (adj_eb >= std::numeric_limits<float>::min());
+static int noa_range_blocks(int insize, int blocks)
+{
+  const int chunks = 1 + (insize - 1) / CS;
+  return (blocks < chunks) ? blocks : chunks;
+}
 
-  // loop over chunks
-  do {
-    // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
-    __syncthreads();  // chunk[last] produced, chunk consumed
 
-    // terminate if done
-    const int chunkID = chunk[last];
-    const int base = chunkID * CS;
-    if (base >= insize) break;
-
-    // load chunk
-    const int osize = min(CS, insize - base);
-    long long* const input_l = (long long*)&input[base];
-    long long* const out_l = (long long*)out;
-    for (int i = tid; i < osize / 8; i += TPB) {
-      out_l[i] = input_l[i];
-    }
-    const int extra = osize % 8;
-    if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-
-    // encode chunk
-    __syncthreads();  // chunk produced, chunk[last] consumed
-    int csize = osize;
-    bool good = true;
-    if (good_eb) {
-      byte* tmp = in; in = out; out = tmp;
-      d_QNOA_4(csize, in, out, adj_eb, threshold);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_DIFFNB_4(csize, in, out, temp);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      d_BIT_4(csize, in, out, temp);
-      __syncthreads();
-    }
-    if (good) {
-      byte* tmp = in; in = out; out = tmp;
-      good = d_RZE_1(csize, in, out, temp);
-      __syncthreads();
-    }
-
-    // handle carry
-    if (!good || (csize >= osize)) csize = osize;
-    propagate_carry(csize, chunkID, fullcarry, (int*)temp);
-
-    // reload chunk if incompressible
-    if (tid == 0) size_out[chunkID] = csize;
-    if (csize == osize) {
-      // store original data
-      long long* const out_l = (long long*)out;
-      for (int i = tid; i < osize / 8; i += TPB) {
-        out_l[i] = input_l[i];
-      }
-      const int extra = osize % 8;
-      if (tid < extra) out[osize - extra + tid] = input[base + osize - extra + tid];
-    }
-    __syncthreads();  // "out" done, temp produced
-
-    // store chunk
-    const int offs = (chunkID == 0) ? 0 : *((int*)temp);
-    s2g(&data_out[offs], out, csize);
-
-    // finalize if last chunk
-    if ((tid == 0) && (base + CS >= insize)) {
-      // output header
-      head_out[0] = (long long)insize;
-      float* const head_out_f = (float*)&head_out[1];
-      head_out_f[0] = adj_eb;
-      // compute compressed size
-      *outsize = &data_out[fullcarry[chunkID]] - output;
-    }
-  } while (true);
+// Scratch holds one float2 per range block. All work uses the default stream.
+static NoaQuantizer prepare_noa_quantizer(const byte* input, int insize, float errorbound,
+                                          float threshold, float2* range_scratch, int blocks)
+{
+  const auto* values = reinterpret_cast<const float*>(input);
+  const int count = insize / sizeof(float);
+  if (!range_scratch) {
+    const auto dev_ptr = thrust::device_pointer_cast(values);
+    const auto min_max = thrust::minmax_element(thrust::device, dev_ptr, dev_ptr + count);
+    return {errorbound, threshold, thrust::raw_pointer_cast(min_max.second),
+            thrust::raw_pointer_cast(min_max.first)};
+  }
+  const int range_blocks = noa_range_blocks(insize, blocks);
+  d_noa_range_partials<<<range_blocks, NOA_RANGE_THREADS>>>(values, count, range_scratch);
+  check_compression_hip(hipGetLastError(), "launch NOA range partials");
+  if (range_blocks > 1) {
+    d_noa_range_finish<<<1, NOA_RANGE_THREADS>>>(values, range_blocks, range_scratch);
+    check_compression_hip(hipGetLastError(), "launch NOA range finish");
+  }
+  return {errorbound, threshold, &range_scratch[0].y, &range_scratch[0].x};
 }
 
 
@@ -324,7 +228,7 @@ static void CheckHip(const int line)
 }
 
 
-int main(int argc, char* argv [])
+int main(int argc, char* argv []) try
 {
   printf("PFPL GPU Single-Precision NOA Compressor\n");
   printf("Copyright 2025 Texas State University\n\n");
@@ -332,15 +236,8 @@ int main(int argc, char* argv [])
   // read input from file
   if (argc < 4 || argc > 5) {printf("USAGE: %s input_file_name compressed_file_name error_bound [threshold]\n\n", argv[0]);  throw std::runtime_error("LC error");}
 
-  FILE* const fin = fopen(argv[1], "rb");
-  fseek(fin, 0, SEEK_END);
-  const long long fsize = ftell(fin);
-  if (fsize <= 0) {fprintf(stderr, "ERROR: input file too small\n\n"); throw std::runtime_error("LC error");}
-  if (fsize >= 2147221529) {fprintf(stderr, "ERROR: input file too large\n\n"); throw std::runtime_error("LC error");}
-  byte* const input = new byte [fsize];
-  fseek(fin, 0, SEEK_SET);
-  const int insize = fread(input, 1, fsize, fin);  assert(insize == fsize);
-  fclose(fin);
+  int insize;
+  const auto input = read_f32_input(argv[1], insize);
   printf("original size: %d bytes\n", insize);
 
   // get GPU info
@@ -351,22 +248,31 @@ int main(int argc, char* argv [])
   const int SMs = deviceProp.multiProcessorCount;
   const int mTpSM = deviceProp.maxThreadsPerMultiProcessor;
   const int blocks = SMs * (mTpSM / TPB);
-  const int chunks = (insize + CS - 1) / CS;  // round up
+  const int chunks = 1 + (insize - 1) / CS;
   CheckHip(__LINE__);
-  const int maxsize = 3 * sizeof(int) + chunks * sizeof(short) + chunks * CS;
+  const std::size_t maxsize = 16 + 2 * static_cast<std::size_t>(chunks) + insize;
 
   // allocate GPU memory
   byte* dencoded;
-  hipHostMalloc((void **)&dencoded, maxsize);
+  check_compression_hip(hipHostMalloc((void**)&dencoded, maxsize), "allocate host packet buffer");
   byte* d_input;
-  hipMalloc((void **)&d_input, insize);
-  hipMemcpy(d_input, input, insize, hipMemcpyHostToDevice);
+  check_compression_hip(hipMalloc((void**)&d_input, insize), "allocate compression input");
+  check_compression_hip(hipMemcpy(d_input, input.get(), insize, hipMemcpyHostToDevice),
+                        "transfer compression input");
   byte* d_encoded;
-  hipMalloc((void **)&d_encoded, maxsize);
+  check_compression_hip(hipMalloc((void**)&d_encoded, maxsize), "allocate compression packet buffer");
   int* d_encsize;
-  hipMalloc((void **)&d_encsize, sizeof(int));
-  int* d_fullcarry;
-  hipMalloc((void**)&d_fullcarry, chunks * sizeof(int));
+  check_compression_hip(hipMalloc((void**)&d_encsize, sizeof(int)), "allocate packet size");
+  const EncodeScratch scratch(insize);
+  float2* range_scratch = nullptr;
+  const auto range_status = hipMalloc((void**)&range_scratch,
+                                     static_cast<std::size_t>(noa_range_blocks(insize, blocks)) * sizeof(float2));
+  if (range_status == hipErrorOutOfMemory) {
+    static_cast<void>(hipGetLastError());
+    range_scratch = nullptr;
+  } else {
+    check_compression_hip(range_status, "allocate NOA range scratch");
+  }
   CheckHip(__LINE__);
 
   const float errorbound = atof(argv[3]);
@@ -377,13 +283,8 @@ int main(int argc, char* argv [])
     hipDeviceSynchronize();
     dtimer.start();
 
-    d_reset<<<1, 1>>>();
-    hipMemset(d_fullcarry, 0, chunks * sizeof(int));
-
-    thrust::device_ptr<float> dev_ptr = thrust::device_pointer_cast((float*)d_input);
-    thrust::pair<thrust::device_ptr<float>, thrust::device_ptr<float>> min_max = thrust::minmax_element(thrust::device, dev_ptr, dev_ptr + (insize / sizeof(float)));
-
-    d_encode<<<blocks, TPB>>>(d_input, insize, d_encoded, d_encsize, d_fullcarry, errorbound, threshold, thrust::raw_pointer_cast(min_max.second), thrust::raw_pointer_cast(min_max.first));
+    const auto quantizer = prepare_noa_quantizer(d_input, insize, errorbound, threshold, range_scratch, blocks);
+    submit_encode(d_input, insize, d_encoded, d_encsize, scratch, blocks, quantizer);
 
     hipDeviceSynchronize();
     double runtime = dtimer.stop();
@@ -398,25 +299,32 @@ int main(int argc, char* argv [])
 
   // get encoded GPU result
   int dencsize = 0;
-  hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost);
-  hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost);
+  check_compression_hip(hipMemcpy(&dencsize, d_encsize, sizeof(int), hipMemcpyDeviceToHost),
+                        "read packet size");
+  if (dencsize <= 0 || static_cast<std::size_t>(dencsize) > maxsize)
+    throw std::runtime_error("Encoded packet size is outside the supported range");
+  check_compression_hip(hipMemcpy(dencoded, d_encoded, dencsize, hipMemcpyDeviceToHost),
+                        "read encoded packet");
   printf("encoded size: %d bytes\n", dencsize);
   printf("compression ratio: %.2f\n", 1.0 * insize / dencsize);
   CheckHip(__LINE__);
 
   // write to file
-  FILE* const fout = fopen(argv[2], "wb");
-  fwrite(dencoded, 1, dencsize, fout);
-  fclose(fout);
+  write_f32_output(argv[2], dencoded, dencsize);
 
   // clean up GPU memory
+  if (range_scratch) check_compression_hip(hipFree(range_scratch), "release NOA range scratch");
   hipFree(d_input);
   hipFree(d_encoded);
   hipFree(d_encsize);
   CheckHip(__LINE__);
 
   // clean up
-  delete [] input;
   hipHostFree(dencoded);
   return 0;
+}
+catch (const std::exception& error)
+{
+  fprintf(stderr, "%s\n", error.what());
+  return 1;
 }
